@@ -1,0 +1,70 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  macOS LaunchAgent template for the ETH/BTC bot.
+
+  Install:
+      cp com.scottguts.eth-btc-bot.plist ~/Library/LaunchAgents/
+      launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.scottguts.eth-btc-bot.plist
+      launchctl enable    gui/$(id -u)/com.scottguts.eth-btc-bot
+      launchctl kickstart -k gui/$(id -u)/com.scottguts.eth-btc-bot
+
+  Status:
+      launchctl print gui/$(id -u)/com.scottguts.eth-btc-bot
+
+  Logs:
+      tail -f ~/Library/Logs/eth_btc_bot/bot.log
+
+  Stop & uninstall:
+      launchctl bootout gui/$(id -u) ~/Library/LaunchAgents/com.scottguts.eth-btc-bot.plist
+      rm ~/Library/LaunchAgents/com.scottguts.eth-btc-bot.plist
+
+  Notes:
+    - Edit the absolute paths below if your repo is checked out somewhere
+      other than /Users/scottgutwetter/eth_btc_bot.
+    - Secrets live in bot.env (mode 0600), not in this file.
+    - `caffeinate -i -s` (in run_bot.sh) prevents idle/system sleep while
+      running, but does NOT prevent lid-close sleep on a laptop. For 24/7
+      with the lid closed, use install_bot_on_server.sh on a VPS instead.
+-->
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.scottguts.eth-btc-bot</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/Users/scottgutwetter/eth_btc_bot/run_bot.sh</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>/Users/scottgutwetter/eth_btc_bot</string>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <key>KeepAlive</key>
+    <true/>
+    <key>ThrottleInterval</key>
+    <integer>30</integer>
+
+    <key>ProcessType</key>
+    <string>Background</string>
+    <key>Nice</key>
+    <integer>5</integer>
+
+    <key>StandardOutPath</key>
+    <string>/Users/scottgutwetter/Library/Logs/eth_btc_bot/bot.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/scottgutwetter/Library/Logs/eth_btc_bot/bot.log</string>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+        <key>LANG</key>
+        <string>en_US.UTF-8</string>
+    </dict>
+</dict>
+</plist>

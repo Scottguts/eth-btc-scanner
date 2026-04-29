@@ -109,6 +109,44 @@ real inbox.
 
 ---
 
+## Run locally on macOS (LaunchAgent)
+
+If you just want it running on your laptop, the included `run_bot.sh` and
+`com.scottguts.eth-btc-bot.plist` set it up as a user LaunchAgent that:
+
+- starts automatically when you log in,
+- restarts itself on crash (with a 30 s back-off),
+- wraps the bot in `caffeinate -i -s` so the system won't idle-sleep,
+- logs to `~/Library/Logs/eth_btc_bot/bot.log`,
+- reads secrets from `bot.env` (mode 0600), not from the plist.
+
+```bash
+cp bot.env.example bot.env       # then fill in real Telegram values
+chmod 600 bot.env
+
+# Edit the absolute paths in the plist if your repo isn't at
+# /Users/<you>/eth_btc_bot, then:
+cp com.scottguts.eth-btc-bot.plist ~/Library/LaunchAgents/
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.scottguts.eth-btc-bot.plist
+launchctl enable    gui/$(id -u)/com.scottguts.eth-btc-bot
+launchctl kickstart -k gui/$(id -u)/com.scottguts.eth-btc-bot
+
+# Watch it work:
+tail -f ~/Library/Logs/eth_btc_bot/bot.log
+```
+
+**Important caveat:** macOS sleeps the *whole machine* when the laptop lid
+closes. `caffeinate` blocks idle/system sleep but cannot block lid-close
+sleep on a bare laptop. If you need true 24/7 operation with the lid
+closed, use clamshell mode (external display + keyboard + power) or run
+the bot on a small VPS via the systemd installer below.
+
+To stop it:
+
+```bash
+launchctl bootout gui/$(id -u) ~/Library/LaunchAgents/com.scottguts.eth-btc-bot.plist
+```
+
 ## Deploy on a server (systemd)
 
 See [`install_bot_on_server.sh`](install_bot_on_server.sh). On a fresh
