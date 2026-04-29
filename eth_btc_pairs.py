@@ -1,0 +1,990 @@
+"""
+ETH vs BTC pairs-trading signal
+================================
+
+Pulls daily closes for ETHUSDT and BTCUSDT from Binance's public API,
+computes the log-ratio log(ETH/BTC), z-scores it against a rolling
+window, and emits a simple mean-reversion signal:
+
+    position = +1  (long ETH / short BTC)   when z < -ENTRY_Z
+    position = -1  (short ETH / long BTC)   when z > +ENTRY_Z
+    position =  0  (flat)                    when |z| < EXIT_Z after being in a trade
+    hard stop                                when |z| > STOP_Z
+
+It also runs a simple dollar-neutral backtest on the log-ratio,
+prints today's signal, saves the full timeseries to CSV, and
+writes a diagnostic chart.
+
+THIS IS NOT FINANCIAL ADVICE. It's a signal generator to study.
+No order execution — that's intentional. Paper-trade it first.
+
+Usage:
+    # one-shot: print current signal and exit
+    python eth_btc_pairs.py
+
+    # live poller (Binance): re-check every 15 minutes, alert on position flips
+    python eth_btc_pairs.py --loop
+    python eth_btc_pairs.py --loop --interval-minutes 15
+    python eth_btc_pairs.py --loop --interval-minutes 5 --kline 1h
+
+    # alternate source: CoinMarketCap (free tier only gives latest quotes,
+    # so the script accumulates its own history locally; signal goes live
+    # once ROLLING_WINDOW+1 samples are collected)
+    export CMC_API_KEY=your_key_here
+    python eth_btc_pairs.py --source cmc --loop --interval-minutes 15
+
+    # email (or email-to-SMS gateway) alerts on position flips
+    export SMTP_HOST=smtp.gmail.com SMTP_USER=you@gmail.com SMTP_PASS=app_pw
+    export ALERT_TO="you@gmail.com,5555551234@tmomail.net"
+    python eth_btc_pairs.py --test-alert             # send one test email
+    python eth_btc_pairs.py --loop --alert-email     # alert on every flip
+
+    # Telegram alerts on position flips (recommended: easier + more reliable)
+    export TELEGRAM_BOT_TOKEN=123:abc...
+    python eth_btc_pairs.py --telegram-find-chat-id  # after messaging bot once
+    export TELEGRAM_CHAT_ID=582374991
+    python eth_btc_pairs.py --test-alert             # send one test
+    python eth_btc_pairs.py --loop --alert-telegram  # alert on every flip
+"""
+
+from __future__ import annotations
+
+import sys
+import os
+import time
+import math
+import json
+import signal as _signal
+import argparse
+from datetime import datetime, timezone, timedelta
+
+import smtplib
+import ssl as _ssl
+from email.mime.text import MIMEText
+from email.utils import formatdate, make_msgid
+
+import numpy as np
+import pandas as pd
+import requests
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+
+# ---------- CONFIG ----------
+LOOKBACK_LIMIT = 1000         # Binance max candles per request (~2.7y daily)
+INTERVAL       = "1d"         # "1h" / "4h" / "1d"
+ROLLING_WINDOW = 30           # z-score lookback (bars)
+ENTRY_Z        = 2.0          # enter when |z| > 2
+EXIT_Z         = 0.3          # exit back toward mean
+STOP_Z         = 3.5          # bail if it keeps running against you
+FEE_BPS        = 4.0          # 0.04% per leg per trade (perp taker-ish)
+OUT_DIR        = "."          # write outputs next to the script
+
+# CoinMarketCap (optional alternate source; free tier = latest quotes only)
+CMC_BASE       = "https://pro-api.coinmarketcap.com"
+CMC_HISTORY    = f"{OUT_DIR}/eth_btc_cmc_history.csv"
+# ----------------------------
+
+
+def fetch_cmc_latest(api_key: str,
+                     symbols: tuple[str, ...] = ("BTC", "ETH")) -> dict:
+    """Fetch latest USD quotes from CoinMarketCap (free tier friendly).
+
+    Returns {"BTC": price, "ETH": price, "ts": pandas.Timestamp (UTC)}.
+    """
+    url = f"{CMC_BASE}/v2/cryptocurrency/quotes/latest"
+    headers = {"X-CMC_PRO_API_KEY": api_key, "Accept": "application/json"}
+    params  = {"symbol": ",".join(symbols), "convert": "USD"}
+    r = requests.get(url, headers=headers, params=params, timeout=20)
+    r.raise_for_status()
+    payload = r.json()
+    if payload.get("status", {}).get("error_code", 0) != 0:
+        raise RuntimeError(f"CMC error: {payload['status']}")
+    out = {}
+    for sym in symbols:
+        # /v2 returns a list per symbol; take the first active entry
+        entries = payload["data"].get(sym, [])
+        if not entries:
+            raise RuntimeError(f"CMC returned no data for {sym}")
+        out[sym] = float(entries[0]["quote"]["USD"]["price"])
+    out["ts"] = pd.Timestamp.now(tz="UTC").floor("s")
+    return out
+
+
+def cmc_append_history(snap: dict, path: str = CMC_HISTORY) -> pd.DataFrame:
+    """Append a snapshot to the persistent CMC history CSV and return the full series."""
+    row = pd.DataFrame(
+        [{"time": snap["ts"], "btc": snap["BTC"], "eth": snap["ETH"]}]
+    ).set_index("time")
+    if os.path.exists(path):
+        prior = pd.read_csv(path, index_col="time", parse_dates=True)
+        # tz-normalize just in case
+        if prior.index.tz is None:
+            prior.index = prior.index.tz_localize("UTC")
+        df = pd.concat([prior, row])
+    else:
+        df = row
+    # de-dupe on minute-floor (avoid runaway rows if poller runs often)
+    df = df[~df.index.floor("min").duplicated(keep="last")]
+    df = df.sort_index()
+    df.to_csv(path)
+    return df
+
+
+# Try binance.com first (better liquidity, more history). If a given host
+# geo-blocks us with 451/403, fall through to the next one and remember it.
+BINANCE_BASES = ["https://api.binance.com", "https://api.binance.us"]
+
+
+def fetch_klines(symbol: str, interval: str, limit: int = 1000) -> pd.DataFrame:
+    """Fetch OHLCV klines from Binance public REST API (no auth).
+
+    Tries binance.com first; on 451 ("Unavailable For Legal Reasons", the US
+    geo-block) or 403, falls back to binance.us. Caches the working host so
+    subsequent calls go straight there without paying the retry latency.
+    """
+    params = {"symbol": symbol, "interval": interval, "limit": limit}
+    last_err: Exception | None = None
+    for base in list(BINANCE_BASES):
+        try:
+            r = requests.get(f"{base}/api/v3/klines",
+                             params=params, timeout=30)
+            r.raise_for_status()
+        except requests.HTTPError as e:
+            status = e.response.status_code if e.response is not None else None
+            if status in (451, 403, 418):
+                last_err = e
+                continue  # try next host
+            raise
+        except requests.RequestException as e:
+            last_err = e
+            continue
+        # Success — remember this host for the rest of the process.
+        if BINANCE_BASES[0] != base:
+            BINANCE_BASES.remove(base)
+            BINANCE_BASES.insert(0, base)
+        rows = r.json()
+        cols = ["openTime", "open", "high", "low", "close", "volume",
+                "closeTime", "qav", "trades", "tbav", "tbqv", "ignore"]
+        df = pd.DataFrame(rows, columns=cols)
+        df["time"]  = pd.to_datetime(df["closeTime"], unit="ms", utc=True)
+        df["close"] = df["close"].astype(float)
+        return df.set_index("time")[["close"]].rename(columns={"close": symbol})
+
+    raise last_err or RuntimeError("all Binance endpoints failed")
+
+
+def compute_zscore(ratio: pd.Series, window: int) -> pd.Series:
+    log_r = np.log(ratio)
+    mean  = log_r.rolling(window).mean()
+    std   = log_r.rolling(window).std()
+    # Guard against zero std (e.g., a stuck price) producing inf z-scores
+    # that would falsely trigger entries / stops.
+    std   = std.where(std > 0)
+    return (log_r - mean) / std
+
+
+def generate_positions(
+    z: pd.Series,
+    entry: float = ENTRY_Z,
+    exit_:  float = EXIT_Z,
+    stop:   float = STOP_Z,
+) -> pd.Series:
+    """
+    State machine:
+        flat  -> long  ratio  if z < -entry
+        flat  -> short ratio  if z > +entry
+        long  -> flat         if z > -exit  OR  z < -stop
+        short -> flat         if z <  exit  OR  z >  stop
+    """
+    pos = np.zeros(len(z))
+    current = 0
+    for i, zt in enumerate(z.values):
+        if np.isnan(zt):
+            pos[i] = 0
+            continue
+        if current == 0:
+            if zt >  entry:
+                current = -1
+            elif zt < -entry:
+                current = +1
+        elif current == +1:
+            if zt > -exit_ or zt < -stop:
+                current = 0
+        elif current == -1:
+            if zt <  exit_ or zt >  stop:
+                current = 0
+        pos[i] = current
+    return pd.Series(pos, index=z.index, name="position")
+
+
+def backtest(eth: pd.Series, btc: pd.Series, pos: pd.Series,
+             fee_bps: float = FEE_BPS) -> pd.DataFrame:
+    """
+    Dollar-neutral: P&L = position_{t-1} * d log(ETH/BTC)_t
+    Fees charged on every position *change*, applied across 2 legs.
+    """
+    log_ratio = np.log(eth / btc)
+    ratio_ret = log_ratio.diff().fillna(0.0)
+
+    gross = pos.shift(1).fillna(0.0) * ratio_ret
+
+    # Turnover = |pos_t - pos_{t-1}|, fee hits 2 legs
+    turnover = pos.diff().abs().fillna(0.0)
+    fee_cost = turnover * (fee_bps / 1e4) * 2.0
+
+    net = gross - fee_cost
+    equity = net.cumsum().apply(np.exp)
+    return pd.DataFrame({
+        "ratio_ret":  ratio_ret,
+        "gross_ret":  gross,
+        "fee":        fee_cost,
+        "net_ret":    net,
+        "equity":     equity,
+    })
+
+
+def extract_trades(df: pd.DataFrame, fee_bps: float = FEE_BPS) -> pd.DataFrame:
+    """Walk the position series and return one row per pairs trade.
+
+    A trade starts when `pos` flips away from 0, and ends when `pos` returns to
+    0 (or flips sign — a flip-without-flat is split into two trades). The last
+    trade is left open if `pos` is non-zero at the end of the series.
+
+    Returned columns:
+      entry_time, exit_time, position (+1/-1), bars_held,
+      entry_eth, entry_btc, entry_ratio, entry_z,
+      exit_eth,  exit_btc,  exit_ratio,  exit_z,
+      log_pnl, pct_pnl, fees_bps_total, status ("CLOSED" or "OPEN")
+    """
+    rows = []
+    pos = df["pos"].fillna(0).astype(int).values
+    times = df.index.to_list()
+    eth = df["eth"].values
+    btc = df["btc"].values
+    ratio = df["ratio"].values
+    z = df["z"].values
+
+    open_trade = None  # dict, accumulates while a trade is live
+
+    def _close(idx: int, status: str = "CLOSED") -> None:
+        nonlocal open_trade
+        if open_trade is None:
+            return
+        side = open_trade["position"]
+        log_pnl = side * (math.log(ratio[idx]) - math.log(open_trade["entry_ratio"]))
+        # Two legs in, two legs out -> 4x bps; keep gross + fee separate.
+        fees_total_bps = fee_bps * 4.0
+        pct_pnl = (math.exp(log_pnl) - 1.0) * 100.0
+        rows.append({
+            **open_trade,
+            "exit_time":  times[idx],
+            "exit_eth":   float(eth[idx]),
+            "exit_btc":   float(btc[idx]),
+            "exit_ratio": float(ratio[idx]),
+            "exit_z":     float(z[idx]),
+            "bars_held":  idx - open_trade["_entry_idx"],
+            "log_pnl":    float(log_pnl),
+            "pct_pnl":    float(pct_pnl),
+            "fees_bps_total": fees_total_bps,
+            "status":     status,
+        })
+        open_trade = None
+
+    for i in range(1, len(pos)):
+        prev, cur = pos[i - 1], pos[i]
+        if prev == 0 and cur != 0:           # entry from flat
+            open_trade = {
+                "_entry_idx":  i,
+                "entry_time":  times[i],
+                "position":    int(cur),
+                "entry_eth":   float(eth[i]),
+                "entry_btc":   float(btc[i]),
+                "entry_ratio": float(ratio[i]),
+                "entry_z":     float(z[i]),
+            }
+        elif prev != 0 and cur == 0:         # exit to flat
+            _close(i, status="CLOSED")
+        elif prev != 0 and cur != 0 and prev != cur:
+            # direction flip without going flat — close at this bar, open new
+            _close(i, status="CLOSED")
+            open_trade = {
+                "_entry_idx":  i,
+                "entry_time":  times[i],
+                "position":    int(cur),
+                "entry_eth":   float(eth[i]),
+                "entry_btc":   float(btc[i]),
+                "entry_ratio": float(ratio[i]),
+                "entry_z":     float(z[i]),
+            }
+
+    if open_trade is not None:
+        # Mark the live trade as still open, using the last bar as a snapshot.
+        last = len(pos) - 1
+        side = open_trade["position"]
+        log_pnl = side * (math.log(ratio[last]) - math.log(open_trade["entry_ratio"]))
+        rows.append({
+            **open_trade,
+            "exit_time":  None,
+            "exit_eth":   None,
+            "exit_btc":   None,
+            "exit_ratio": None,
+            "exit_z":     None,
+            "bars_held":  last - open_trade["_entry_idx"],
+            "log_pnl":    float(log_pnl),
+            "pct_pnl":    float((math.exp(log_pnl) - 1.0) * 100.0),
+            "fees_bps_total": fee_bps * 2.0,  # only entry legs paid so far
+            "status":     "OPEN",
+        })
+
+    if not rows:
+        return pd.DataFrame(columns=[
+            "entry_time", "exit_time", "position", "bars_held",
+            "entry_eth", "entry_btc", "entry_ratio", "entry_z",
+            "exit_eth", "exit_btc", "exit_ratio", "exit_z",
+            "log_pnl", "pct_pnl", "fees_bps_total", "status",
+        ])
+    out = pd.DataFrame(rows).drop(columns=["_entry_idx"])
+    return out
+
+
+def perf_stats(net_ret: pd.Series, pos: pd.Series,
+               periods_per_year: float) -> dict:
+    """Compute summary stats. ``pos`` is needed to count real trades and to
+    restrict hit-rate to bars where we were actually in a trade (otherwise
+    flat bars dilute the metric and make it look much worse than it is).
+    """
+    r = net_ret.dropna()
+    if r.std() == 0 or len(r) < 2:
+        return {"sharpe": 0.0, "cagr": 0.0, "max_dd": 0.0,
+                "hit_rate": 0.0, "n_trades": 0, "n_bars_active": 0,
+                "pct_time_in_trade": 0.0}
+    mu   = r.mean() * periods_per_year
+    sig  = r.std() * math.sqrt(periods_per_year)
+    eq   = np.exp(r.cumsum())
+    peak = eq.cummax()
+    dd   = (eq / peak - 1).min()
+
+    active = pos.shift(1).fillna(0.0).reindex(r.index).fillna(0.0).abs() > 0
+    n_bars_active = int(active.sum())
+    hit_rate = float((r[active] > 0).mean()) if n_bars_active else 0.0
+    # A "trade" is a non-zero run of position; count entries from a flat bar.
+    p = pos.fillna(0.0).astype(int).values
+    n_trades = 0
+    prev = 0
+    for v in p:
+        if v != 0 and prev == 0:
+            n_trades += 1
+        prev = v
+    return {
+        "sharpe":            mu / sig if sig else 0.0,
+        "cagr":              float(np.exp(mu) - 1),
+        "max_dd":            float(dd),
+        "hit_rate":          hit_rate,
+        "n_trades":          n_trades,
+        "n_bars_active":     n_bars_active,
+        "pct_time_in_trade": float(active.mean()),
+    }
+
+
+def describe_signal(z_now: float, pos_now: float) -> str:
+    """One-line summary of what the bot thinks you should be doing right now."""
+    if pos_now == +1:
+        return (f"IN TRADE: long ETH / short BTC (ETH cheap vs BTC, "
+                f"z={z_now:+.2f}). Hold until z returns toward 0.")
+    if pos_now == -1:
+        return (f"IN TRADE: short ETH / long BTC (ETH rich vs BTC, "
+                f"z={z_now:+.2f}). Hold until z returns toward 0.")
+    if z_now >  ENTRY_Z:
+        return (f"FLAT, watching: z={z_now:+.2f} above +{ENTRY_Z}. "
+                f"Next bar may trigger SHORT ETH / LONG BTC.")
+    if z_now < -ENTRY_Z:
+        return (f"FLAT, watching: z={z_now:+.2f} below -{ENTRY_Z}. "
+                f"Next bar may trigger LONG ETH / SHORT BTC.")
+    return (f"FLAT, no edge: z={z_now:+.2f} inside +/-{ENTRY_Z}. "
+            f"Wait for divergence.")
+
+
+STATE_FILE = f"{OUT_DIR}/eth_btc_state.json"
+
+
+# ========================= Telegram alerts ============================
+
+TELEGRAM_BASE = "https://api.telegram.org"
+
+
+def _load_telegram_config() -> dict | None:
+    tok = os.environ.get("TELEGRAM_BOT_TOKEN")
+    cid = os.environ.get("TELEGRAM_CHAT_ID")
+    if not tok:
+        return None
+    return {"token": tok, "chat_id": cid}
+
+
+def send_telegram_alert(subject: str, body: str, cfg: dict,
+                        timeout: float = 20.0) -> None:
+    """Send a Markdown-formatted message via Telegram Bot API."""
+    if not cfg.get("chat_id"):
+        raise RuntimeError("TELEGRAM_CHAT_ID not set. Run "
+                           "`python eth_btc_pairs.py --telegram-find-chat-id` "
+                           "after messaging your bot once.")
+    # Escape minimal Markdown chars that would blow up the parser in our payload.
+    # We use the legacy "Markdown" mode to avoid MarkdownV2's aggressive escaping.
+    text = f"*{subject}*\n\n```\n{body}```"
+    url  = f"{TELEGRAM_BASE}/bot{cfg['token']}/sendMessage"
+    r = requests.post(url, json={
+        "chat_id": cfg["chat_id"],
+        "text":    text,
+        "parse_mode": "Markdown",
+        "disable_web_page_preview": True,
+    }, timeout=timeout)
+    if r.status_code != 200 or not r.json().get("ok"):
+        raise RuntimeError(f"Telegram API error: {r.status_code} {r.text[:200]}")
+
+
+def telegram_find_chat_id(token: str, timeout: float = 20.0) -> dict[int, str]:
+    """Call getUpdates and return {chat_id: label} for any chats that have
+    messaged the bot recently. User must have tapped Start / sent /start first.
+    """
+    url = f"{TELEGRAM_BASE}/bot{token}/getUpdates"
+    r = requests.get(url, timeout=timeout)
+    r.raise_for_status()
+    chats: dict[int, str] = {}
+    for u in r.json().get("result", []):
+        msg = u.get("message") or u.get("edited_message") or u.get("channel_post") or {}
+        chat = msg.get("chat") or {}
+        cid = chat.get("id")
+        if cid is None:
+            continue
+        label = (f"{chat.get('first_name','')} {chat.get('last_name','')}".strip()
+                 or chat.get("username") or chat.get("title") or "unnamed")
+        chats[cid] = label
+    return chats
+
+
+# ========================= email / SMS alerts =========================
+
+def _load_alert_config() -> dict | None:
+    """Build alert config from env vars. Returns None if not configured.
+
+    Required env vars:
+      SMTP_HOST, SMTP_USER, SMTP_PASS, ALERT_TO
+    Optional:
+      SMTP_PORT (default 587)
+      SMTP_SSL  ('1' => SMTPS; else STARTTLS on port 587)
+      ALERT_FROM (defaults to SMTP_USER)
+
+    ALERT_TO is comma-separated. Entries can be regular emails or
+    email-to-SMS gateway addresses such as:
+        5555551234@tmomail.net     (T-Mobile)
+        5555551234@vtext.com       (Verizon — flaky; many carriers
+                                    have been deprecating these)
+        5555551234@msg.fi.google.com (Google Fi)
+    Delivery to carrier gateways is unreliable by 2024-2026 — prefer
+    a normal email inbox on your phone if at all possible.
+    """
+    host = os.environ.get("SMTP_HOST")
+    user = os.environ.get("SMTP_USER")
+    pwd  = os.environ.get("SMTP_PASS")
+    to   = os.environ.get("ALERT_TO")
+    if not (host and user and pwd and to):
+        return None
+    return {
+        "host":       host,
+        "port":       int(os.environ.get("SMTP_PORT", "587")),
+        "user":       user,
+        "password":   pwd,
+        "use_ssl":    os.environ.get("SMTP_SSL", "0") == "1",
+        "sender":     os.environ.get("ALERT_FROM", user),
+        "recipients": [r.strip() for r in to.split(",") if r.strip()],
+    }
+
+
+def send_email_alert(subject: str, body: str, cfg: dict,
+                     timeout: float = 20.0) -> None:
+    """Send a short alert. Subject is kept brief so it fits in an SMS gateway.
+
+    Raises on failure — caller should wrap in try/except in a hot loop.
+    """
+    msg = MIMEText(body, "plain", "utf-8")
+    msg["Subject"] = subject[:120]                 # gateway-friendly
+    msg["From"]    = cfg["sender"]
+    msg["To"]      = ", ".join(cfg["recipients"])
+    msg["Date"]    = formatdate(localtime=True)
+    msg["Message-ID"] = make_msgid()
+
+    if cfg["use_ssl"] or cfg["port"] == 465:
+        ctx = _ssl.create_default_context()
+        with smtplib.SMTP_SSL(cfg["host"], cfg["port"],
+                              timeout=timeout, context=ctx) as srv:
+            srv.login(cfg["user"], cfg["password"])
+            srv.send_message(msg)
+    else:
+        with smtplib.SMTP(cfg["host"], cfg["port"], timeout=timeout) as srv:
+            srv.ehlo()
+            srv.starttls(context=_ssl.create_default_context())
+            srv.ehlo()
+            srv.login(cfg["user"], cfg["password"])
+            srv.send_message(msg)
+
+
+def _format_alert(snap: dict, prev_pos: int) -> tuple[str, str]:
+    """Format an alert: short subject (SMS/Telegram-friendly) and a fuller body
+    that tells the reader what to do, at what prices, and where the targets and
+    stops sit. Body is plain text so it renders cleanly inside Telegram code
+    blocks and email-to-SMS gateways.
+    """
+    pos = snap["position"]
+    tag = {1: "LONG ETH / SHORT BTC",
+           -1: "SHORT ETH / LONG BTC",
+           0: "CLOSE TRADE / FLAT"}[pos]
+    direction = {1: "OPEN", -1: "OPEN", 0: "CLOSE"}[pos]
+    subject = f"ETH/BTC {direction}: {tag} | z={snap['zscore']:+.2f}"
+
+    eth   = snap["eth"]
+    btc   = snap["btc"]
+    ratio = snap["ratio"]
+    z     = snap["zscore"]
+    target = snap.get("target_ratio", float("nan"))
+    stop_up = snap.get("stop_up_ratio", float("nan"))
+    stop_dn = snap.get("stop_dn_ratio", float("nan"))
+    move_pct = snap.get("pct_to_mean", float("nan"))
+
+    # Body format — fixed-width so it lines up in monospace (Telegram code block
+    # / email-to-SMS).
+    lines = []
+    lines.append(f"SIGNAL FLIP: {prev_pos:+d}  ->  {pos:+d}   ({tag})")
+    lines.append(f"Time:        {snap['asof']}")
+    lines.append("")
+
+    if pos == +1:
+        lines.append("WHY:   ETH looks cheap vs BTC (z below entry).")
+        lines.append("DO:    Buy ETH, sell BTC, equal dollars per leg.")
+    elif pos == -1:
+        lines.append("WHY:   ETH looks rich vs BTC (z above entry).")
+        lines.append("DO:    Sell ETH, buy BTC, equal dollars per leg.")
+    else:
+        if prev_pos == +1:
+            lines.append("WHY:   z reverted toward 0 (or stop hit).")
+            lines.append("DO:    Close ETH long, close BTC short.")
+        elif prev_pos == -1:
+            lines.append("WHY:   z reverted toward 0 (or stop hit).")
+            lines.append("DO:    Close ETH short, close BTC long.")
+        else:
+            lines.append("DO:    Flatten any open pairs trade.")
+    lines.append("")
+
+    lines.append("PRICES")
+    lines.append(f"  ETH         ${eth:>12,.2f}")
+    lines.append(f"  BTC         ${btc:>12,.2f}")
+    lines.append(f"  ETH/BTC     {ratio:>13.6f}")
+    lines.append(f"  Z-score     {z:>+13.3f}")
+    lines.append("")
+
+    if pos != 0:
+        lines.append("TARGETS  (where to act)")
+        lines.append(f"  Take profit  ratio ~ {target:.6f}   "
+                     f"(z = 0,  {move_pct:+.2f}% from now)")
+        if pos == +1:
+            lines.append(f"  Hard stop    ratio < {stop_dn:.6f}   "
+                         f"(z = {-STOP_Z:+.1f})")
+        else:
+            lines.append(f"  Hard stop    ratio > {stop_up:.6f}   "
+                         f"(z = {+STOP_Z:+.1f})")
+        lines.append(f"  Soft exit    |z| < {EXIT_Z}")
+        lines.append("")
+
+    lines.append(f"Source: {snap.get('source', 'binance')} "
+                 f"({snap.get('kline', 'n/a')} bars, {ROLLING_WINDOW}-bar window)")
+    lines.append("This is a signal, not an order. Review before trading.")
+
+    body = "\n".join(lines) + "\n"
+    return subject, body
+
+
+# ======================================================================
+
+
+def run_once(kline: str = INTERVAL, source: str = "binance",
+             cmc_api_key: str | None = None,
+             verbose: bool = True, write_artifacts: bool = True) -> dict:
+    """Fetch latest data, compute signal, optionally write CSV/PNG/JSON.
+
+    source = "binance": full historical klines (instant backtest).
+    source = "cmc":     polls CMC latest, accumulates local CSV history.
+                        Needs ROLLING_WINDOW samples before the signal goes live.
+
+    Returns a dict snapshot of the latest row + stats.
+    """
+    now_str = datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%SZ')
+
+    if source == "cmc":
+        if not cmc_api_key:
+            raise RuntimeError("CMC source requires CMC_API_KEY env var or --cmc-key")
+        if verbose:
+            print(f"[{now_str}] Fetching latest BTC+ETH from CoinMarketCap...")
+        snap = fetch_cmc_latest(cmc_api_key)
+        df = cmc_append_history(snap)
+        if verbose:
+            print(f"CMC history samples: {len(df)} "
+                  f"(need {ROLLING_WINDOW+1} for z-score)")
+    else:
+        if verbose:
+            print(f"[{now_str}] Fetching BTCUSDT + ETHUSDT from Binance ({kline})...")
+        btc = fetch_klines("BTCUSDT", kline, LOOKBACK_LIMIT)
+        eth = fetch_klines("ETHUSDT", kline, LOOKBACK_LIMIT)
+        df = pd.concat([btc, eth], axis=1).dropna()
+        df.columns = ["btc", "eth"]
+
+    df["ratio"]   = df["eth"] / df["btc"]
+    log_r         = np.log(df["ratio"])
+    df["log_mu"]  = log_r.rolling(ROLLING_WINDOW).mean()
+    df["log_sd"]  = log_r.rolling(ROLLING_WINDOW).std().where(
+        log_r.rolling(ROLLING_WINDOW).std() > 0)
+    df["z"]       = (log_r - df["log_mu"]) / df["log_sd"]
+    df["pos"]     = generate_positions(df["z"])
+
+    # Backtest only makes sense when we have enough history and a clear bar cadence.
+    if source == "cmc" and len(df) < ROLLING_WINDOW + 2:
+        bootstrap = {
+            "asof":       str(df.index[-1]) if len(df) else now_str,
+            "btc":        float(df["btc"].iloc[-1]) if len(df) else float("nan"),
+            "eth":        float(df["eth"].iloc[-1]) if len(df) else float("nan"),
+            "ratio":      float(df["ratio"].iloc[-1]) if len(df) else float("nan"),
+            "zscore":     float("nan"),
+            "position":   0,
+            "signal":     (f"Bootstrapping local history: {len(df)}/{ROLLING_WINDOW+1} "
+                          f"samples — signal goes live once window is full."),
+            "stats":      {"sharpe": 0.0, "cagr": 0.0, "max_dd": 0.0,
+                           "hit_rate": 0.0, "n_trades": 0,
+                           "n_bars_active": 0, "pct_time_in_trade": 0.0},
+            "kline":      kline,
+            "source":     source,
+        }
+        if verbose:
+            print("=" * 58)
+            print(bootstrap["signal"])
+            print("=" * 58)
+        return bootstrap
+
+    bt = backtest(df["eth"], df["btc"], df["pos"])
+    df = df.join(bt)
+
+    ppy   = {"1d": 365, "4h": 365 * 6, "1h": 365 * 24,
+             "15m": 365 * 24 * 4, "5m": 365 * 24 * 12}.get(kline, 365)
+    stats = perf_stats(df["net_ret"], df["pos"], periods_per_year=ppy)
+    latest = df.dropna().iloc[-1]
+
+    mu_ln  = float(latest["log_mu"])
+    sd_ln  = float(latest["log_sd"])
+    target_ratio = float(np.exp(mu_ln))                       # z = 0
+    stop_up      = float(np.exp(mu_ln + STOP_Z * sd_ln))      # z = +stop
+    stop_dn      = float(np.exp(mu_ln - STOP_Z * sd_ln))      # z = -stop
+    cur_ratio    = float(latest["ratio"])
+    pct_to_mean  = (target_ratio / cur_ratio - 1.0) * 100.0   # signed
+
+    snap = {
+        "asof":          str(latest.name),
+        "btc":           float(latest["btc"]),
+        "eth":           float(latest["eth"]),
+        "ratio":         cur_ratio,
+        "zscore":        float(latest["z"]),
+        "position":      int(latest["pos"]),
+        "target_ratio":  target_ratio,
+        "stop_up_ratio": stop_up,
+        "stop_dn_ratio": stop_dn,
+        "pct_to_mean":   pct_to_mean,
+        "signal":        describe_signal(latest["z"], latest["pos"]),
+        "stats":         stats,
+        "kline":         kline,
+        "source":        source,
+    }
+
+    if verbose:
+        print("=" * 64)
+        print(f"As of:          {latest.name}")
+        print(f"BTC close:      ${latest['btc']:>12,.2f}")
+        print(f"ETH close:      ${latest['eth']:>12,.2f}")
+        print(f"ETH/BTC ratio:  {cur_ratio:>13.6f}   "
+              f"(mean {target_ratio:.6f})")
+        print(f"Z-score ({ROLLING_WINDOW:>2}):  {latest['z']:+13.3f}   "
+              f"(entry +/-{ENTRY_Z}, exit +/-{EXIT_Z}, stop +/-{STOP_Z})")
+        print(f"Position:       {latest['pos']:+13.0f}   "
+              f"(+1 = long ETH/short BTC, -1 = opposite, 0 = flat)")
+        print(f"Mean reverts:   {pct_to_mean:+12.2f}%   "
+              f"(ratio move from now back to z=0)")
+        print(f"Signal:         {snap['signal']}")
+        print("-" * 64)
+        print(f"Backtest ({kline}): "
+              f"Sharpe {stats['sharpe']:.2f} | CAGR {stats['cagr']*100:.1f}% "
+              f"| MaxDD {stats['max_dd']*100:.1f}% | "
+              f"trades {stats['n_trades']} | "
+              f"hit-rate {stats['hit_rate']*100:.1f}% "
+              f"(in-trade) | "
+              f"time-in-trade {stats['pct_time_in_trade']*100:.1f}%")
+        print("=" * 64)
+
+    trades = extract_trades(df)
+
+    if verbose and len(trades):
+        recent = trades.tail(5)
+        print("Recent trades (most recent last):")
+        print(f"  {'entry':19s}  {'exit':19s}  side  bars  pct_pnl   status")
+        for _, t in recent.iterrows():
+            entry = str(t["entry_time"])[:19]
+            exit_ = str(t["exit_time"])[:19] if t["exit_time"] is not None else "(open)"
+            side  = "L_ETH" if t["position"] == 1 else "S_ETH"
+            print(f"  {entry:19s}  {exit_:19s}  {side:5s} "
+                  f"{int(t['bars_held']):4d}  "
+                  f"{t['pct_pnl']:+7.2f}%  {t['status']}")
+        print("=" * 64)
+
+    if write_artifacts:
+        df.to_csv(f"{OUT_DIR}/eth_btc_pairs.csv")
+        trades.to_csv(f"{OUT_DIR}/eth_btc_trades.csv", index=False)
+        with open(f"{OUT_DIR}/eth_btc_latest_signal.json", "w") as f:
+            json.dump(snap, f, indent=2, default=str)
+
+        fig, axes = plt.subplots(3, 1, figsize=(12, 11), sharex=True)
+        axes[0].plot(df.index, df["ratio"], lw=1.2)
+        axes[0].set_title("ETH / BTC price ratio")
+        axes[0].grid(alpha=0.3)
+        axes[1].plot(df.index, df["z"], lw=1.0, color="#444")
+        axes[1].axhline( ENTRY_Z, color="red",   ls="--", alpha=0.7,
+                        label=f"+entry ({ENTRY_Z})")
+        axes[1].axhline(-ENTRY_Z, color="green", ls="--", alpha=0.7,
+                        label=f"-entry (-{ENTRY_Z})")
+        axes[1].axhline( STOP_Z,  color="red",   ls=":",  alpha=0.5,
+                        label=f"stop ({STOP_Z})")
+        axes[1].axhline(-STOP_Z,  color="green", ls=":",  alpha=0.5)
+        axes[1].axhline(0, color="black", lw=0.5)
+        axes[1].set_title(f"Rolling {ROLLING_WINDOW}-bar z-score of log(ETH/BTC)")
+        axes[1].legend(loc="upper left", fontsize=8)
+        axes[1].grid(alpha=0.3)
+        axes[2].plot(df.index, df["equity"], lw=1.2, color="#1a6")
+        axes[2].set_title("Strategy equity curve (dollar-neutral, net of fees)")
+        axes[2].grid(alpha=0.3)
+        plt.tight_layout()
+        plt.savefig(f"{OUT_DIR}/eth_btc_pairs.png", dpi=110)
+        plt.close(fig)
+
+    return snap
+
+
+def _load_state() -> dict:
+    if os.path.exists(STATE_FILE):
+        try:
+            with open(STATE_FILE) as f:
+                return json.load(f)
+        except Exception:
+            pass
+    return {}
+
+
+def _save_state(state: dict) -> None:
+    with open(STATE_FILE, "w") as f:
+        json.dump(state, f, indent=2, default=str)
+
+
+def run_loop(interval_minutes: int, kline: str,
+             source: str = "binance",
+             cmc_api_key: str | None = None,
+             alert_email: bool = False,
+             alert_telegram: bool = False) -> int:
+    """Poll every N minutes. Prints heartbeat; shouts when position flips."""
+    stop = {"flag": False}
+    def _handler(signum, frame):
+        print("\nCaught signal, shutting down cleanly...")
+        stop["flag"] = True
+    _signal.signal(_signal.SIGINT,  _handler)
+    _signal.signal(_signal.SIGTERM, _handler)
+
+    email_cfg = _load_alert_config()    if alert_email    else None
+    tg_cfg    = _load_telegram_config() if alert_telegram else None
+    if alert_email and not email_cfg:
+        print("ERROR: --alert-email set but SMTP_HOST/SMTP_USER/SMTP_PASS/"
+              "ALERT_TO env vars are not all set. See --help for details.",
+              file=sys.stderr)
+        return 2
+    if alert_telegram and not tg_cfg:
+        print("ERROR: --alert-telegram set but TELEGRAM_BOT_TOKEN env var "
+              "is not set.", file=sys.stderr)
+        return 2
+    if alert_telegram and tg_cfg and not tg_cfg.get("chat_id"):
+        print("ERROR: TELEGRAM_CHAT_ID not set. After messaging your bot, "
+              "run: python eth_btc_pairs.py --telegram-find-chat-id",
+              file=sys.stderr)
+        return 2
+
+    state = _load_state()
+    last_pos = state.get("position")
+    print(f"Starting poller: kline={kline}, every {interval_minutes} min. "
+          f"Ctrl-C to stop.")
+    if email_cfg:
+        print(f"Email alerts:    ENABLED -> {', '.join(email_cfg['recipients'])}")
+    if tg_cfg:
+        print(f"Telegram alerts: ENABLED -> chat_id {tg_cfg['chat_id']}")
+    if last_pos is not None:
+        print(f"Resuming from saved state: last position = {last_pos:+d}")
+
+    while not stop["flag"]:
+        try:
+            snap = run_once(kline=kline, source=source,
+                            cmc_api_key=cmc_api_key,
+                            verbose=True, write_artifacts=True)
+        except Exception as e:
+            print(f"[WARN] fetch failed: {type(e).__name__}: {e}. "
+                  f"Will retry in {interval_minutes} min.")
+            snap = None
+
+        if snap is not None:
+            pos_now = snap["position"]
+            flipped = last_pos is not None and pos_now != last_pos
+            if flipped:
+                print("\n" + "!" * 58)
+                print(f"!!  POSITION FLIP: {last_pos:+d}  ->  {pos_now:+d}")
+                print(f"!!  {snap['signal']}")
+                print("!" * 58 + "\n")
+                subj, body = _format_alert(snap, last_pos)
+                if email_cfg:
+                    try:
+                        send_email_alert(subj, body, email_cfg)
+                        print(f"[email] sent to {len(email_cfg['recipients'])} recipient(s)")
+                    except Exception as ex:
+                        print(f"[email] FAILED: {type(ex).__name__}: {ex}")
+                if tg_cfg:
+                    try:
+                        send_telegram_alert(subj, body, tg_cfg)
+                        print(f"[telegram] sent to chat {tg_cfg['chat_id']}")
+                    except Exception as ex:
+                        print(f"[telegram] FAILED: {type(ex).__name__}: {ex}")
+            last_pos = pos_now
+            _save_state({
+                "position": pos_now,
+                "asof":     snap["asof"],
+                "zscore":   snap["zscore"],
+                "updated":  datetime.now(timezone.utc).isoformat(),
+            })
+
+        # sleep in small chunks so Ctrl-C responds quickly
+        slept = 0.0
+        total = interval_minutes * 60.0
+        while slept < total and not stop["flag"]:
+            time.sleep(min(1.0, total - slept))
+            slept += 1.0
+
+    return 0
+
+
+def main(argv: list[str] | None = None) -> int:
+    p = argparse.ArgumentParser(description="ETH/BTC pairs-trading signal")
+    p.add_argument("--loop", action="store_true",
+                   help="poll continuously instead of printing once and exiting")
+    p.add_argument("--interval-minutes", type=int, default=15,
+                   help="polling interval in minutes (default 15). Ignored without --loop.")
+    p.add_argument("--kline", default=INTERVAL,
+                   help=f"Binance kline interval: 1d/4h/1h/15m/5m (default {INTERVAL})")
+    p.add_argument("--source", choices=["binance", "cmc"], default="binance",
+                   help="data source: Binance historical klines (default) or "
+                        "CoinMarketCap latest quotes accumulating locally")
+    p.add_argument("--cmc-key", default=os.environ.get("CMC_API_KEY"),
+                   help="CoinMarketCap API key (or set CMC_API_KEY env var)")
+    p.add_argument("--alert-email", action="store_true",
+                   help="email alerts on position flips. Requires SMTP_HOST, "
+                        "SMTP_USER, SMTP_PASS, ALERT_TO env vars. Optional: "
+                        "SMTP_PORT (587), SMTP_SSL (0), ALERT_FROM. ALERT_TO "
+                        "accepts comma-separated emails or email-to-SMS "
+                        "gateway addresses.")
+    p.add_argument("--alert-telegram", action="store_true",
+                   help="Telegram alerts on position flips. Requires "
+                        "TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID env vars. "
+                        "Find your chat id with --telegram-find-chat-id.")
+    p.add_argument("--telegram-find-chat-id", action="store_true",
+                   help="print chat IDs that have messaged your bot "
+                        "(via getUpdates). Requires TELEGRAM_BOT_TOKEN env var. "
+                        "Message your bot first, then run this.")
+    p.add_argument("--test-alert", action="store_true",
+                   help="send a test through every configured channel "
+                        "(email if SMTP_* env vars set, Telegram if "
+                        "TELEGRAM_BOT_TOKEN + TELEGRAM_CHAT_ID set). Use this "
+                        "to verify credentials before running --loop.")
+    args = p.parse_args(argv)
+
+    if args.telegram_find_chat_id:
+        tok = os.environ.get("TELEGRAM_BOT_TOKEN")
+        if not tok:
+            print("ERROR: TELEGRAM_BOT_TOKEN env var not set.", file=sys.stderr)
+            return 2
+        try:
+            chats = telegram_find_chat_id(tok)
+        except Exception as ex:
+            print(f"FAILED: {type(ex).__name__}: {ex}", file=sys.stderr)
+            return 1
+        if not chats:
+            print("No chats found. Open t.me/<your_bot_username>, tap Start "
+                  "(or send /start), then run this again.")
+            return 1
+        print("Chats that have messaged your bot:")
+        for cid, label in chats.items():
+            print(f"  chat_id = {cid}   ({label})")
+        print("\nExport the chat id you want alerts on, e.g.:")
+        for cid in chats:
+            print(f"  export TELEGRAM_CHAT_ID={cid}")
+            break
+        return 0
+
+    if args.test_alert:
+        email_cfg = _load_alert_config()
+        tg_cfg    = _load_telegram_config()
+        if not email_cfg and not tg_cfg:
+            print("ERROR: no alert channels configured. Set SMTP_* env vars "
+                  "and/or TELEGRAM_BOT_TOKEN + TELEGRAM_CHAT_ID. See --help.",
+                  file=sys.stderr)
+            return 2
+        subj = "ETH/BTC pairs: test alert"
+        body = ("This is a test from eth_btc_pairs.py. If you can read this, "
+                "alerting is configured correctly and you will receive live "
+                "signal flips from --loop.\n")
+        ok_any = False
+        if email_cfg:
+            try:
+                send_email_alert(subj, body, email_cfg)
+                print(f"[email]    sent to {', '.join(email_cfg['recipients'])}")
+                ok_any = True
+            except Exception as ex:
+                print(f"[email]    FAILED: {type(ex).__name__}: {ex}",
+                      file=sys.stderr)
+        if tg_cfg:
+            if not tg_cfg.get("chat_id"):
+                print("[telegram] SKIPPED: TELEGRAM_CHAT_ID not set. "
+                      "Run --telegram-find-chat-id first.", file=sys.stderr)
+            else:
+                try:
+                    send_telegram_alert(subj, body, tg_cfg)
+                    print(f"[telegram] sent to chat {tg_cfg['chat_id']}")
+                    ok_any = True
+                except Exception as ex:
+                    print(f"[telegram] FAILED: {type(ex).__name__}: {ex}",
+                          file=sys.stderr)
+        return 0 if ok_any else 1
+
+    if args.source == "cmc" and not args.cmc_key:
+        print("ERROR: --source cmc requires CMC_API_KEY env var or --cmc-key",
+              file=sys.stderr)
+        return 2
+
+    if args.loop:
+        return run_loop(args.interval_minutes, args.kline,
+                        source=args.source, cmc_api_key=args.cmc_key,
+                        alert_email=args.alert_email,
+                        alert_telegram=args.alert_telegram)
+    run_once(kline=args.kline, source=args.source,
+             cmc_api_key=args.cmc_key,
+             verbose=True, write_artifacts=True)
+    print(f"\nWrote: eth_btc_pairs.csv, eth_btc_pairs.png, "
+          f"eth_btc_trades.csv, eth_btc_latest_signal.json")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

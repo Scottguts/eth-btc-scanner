@@ -1,0 +1,32 @@
+# --- Secrets ---
+bot.env
+.env
+.telegram_chat_id
+chat_id
+
+# --- Bot output / state (regenerated on each run) ---
+eth_btc_pairs.csv
+eth_btc_pairs.png
+eth_btc_trades.csv
+eth_btc_latest_signal.json
+eth_btc_state.json
+eth_btc_cmc_history.csv
+bot.log
+*.log
+
+# --- Python ---
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.venv/
+venv/
+env/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# --- macOS / editor ---
+.DS_Store
+.idea/
+.vscode/
