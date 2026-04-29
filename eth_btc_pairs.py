@@ -786,6 +786,75 @@ def _save_state(state: dict) -> None:
         json.dump(state, f, indent=2, default=str)
 
 
+def _flip_alert_and_save(snap: dict, last_pos: int | None,
+                         email_cfg: dict | None,
+                         tg_cfg: dict | None) -> int:
+    """Compare snap position to last_pos, alert on flip, persist new state.
+    Returns the new position (an int, never None)."""
+    pos_now = snap["position"]
+    flipped = last_pos is not None and pos_now != last_pos
+    if flipped:
+        print("\n" + "!" * 58)
+        print(f"!!  POSITION FLIP: {last_pos:+d}  ->  {pos_now:+d}")
+        print(f"!!  {snap['signal']}")
+        print("!" * 58 + "\n")
+        subj, body = _format_alert(snap, last_pos)
+        if email_cfg:
+            try:
+                send_email_alert(subj, body, email_cfg)
+                print(f"[email] sent to {len(email_cfg['recipients'])} recipient(s)")
+            except Exception as ex:
+                print(f"[email] FAILED: {type(ex).__name__}: {ex}")
+        if tg_cfg:
+            try:
+                send_telegram_alert(subj, body, tg_cfg)
+                print(f"[telegram] sent to chat {tg_cfg['chat_id']}")
+            except Exception as ex:
+                print(f"[telegram] FAILED: {type(ex).__name__}: {ex}")
+    _save_state({
+        "position": pos_now,
+        "asof":     snap["asof"],
+        "zscore":   snap["zscore"],
+        "updated":  datetime.now(timezone.utc).isoformat(),
+    })
+    return pos_now
+
+
+def run_once_with_alerts(kline: str, source: str = "binance",
+                         cmc_api_key: str | None = None,
+                         alert_email: bool = False,
+                         alert_telegram: bool = False) -> int:
+    """One-shot run for CI / cron: fetch, compute, save state, alert on flip,
+    exit. Returns 0 on success, non-zero on misconfiguration. Always tries to
+    succeed if data fetch fails (logs and exits 0) so the cron schedule
+    doesn't go red on a transient outage."""
+    email_cfg = _load_alert_config()    if alert_email    else None
+    tg_cfg    = _load_telegram_config() if alert_telegram else None
+    if alert_email and not email_cfg:
+        print("ERROR: --alert-email set but SMTP_* / ALERT_TO env vars are "
+              "not all set.", file=sys.stderr)
+        return 2
+    if alert_telegram and (not tg_cfg or not tg_cfg.get("chat_id")):
+        print("ERROR: --alert-telegram needs both TELEGRAM_BOT_TOKEN and "
+              "TELEGRAM_CHAT_ID env vars.", file=sys.stderr)
+        return 2
+
+    state = _load_state()
+    last_pos = state.get("position")
+    if last_pos is not None:
+        print(f"Loaded prior state: last position = {last_pos:+d}")
+
+    try:
+        snap = run_once(kline=kline, source=source, cmc_api_key=cmc_api_key,
+                        verbose=True, write_artifacts=True)
+    except Exception as e:
+        print(f"[WARN] fetch failed: {type(e).__name__}: {e}. Skipping.")
+        return 0  # transient failure -> still exit cleanly so cron stays green
+
+    _flip_alert_and_save(snap, last_pos, email_cfg, tg_cfg)
+    return 0
+
+
 def run_loop(interval_minutes: int, kline: str,
              source: str = "binance",
              cmc_api_key: str | None = None,
@@ -838,33 +907,7 @@ def run_loop(interval_minutes: int, kline: str,
             snap = None
 
         if snap is not None:
-            pos_now = snap["position"]
-            flipped = last_pos is not None and pos_now != last_pos
-            if flipped:
-                print("\n" + "!" * 58)
-                print(f"!!  POSITION FLIP: {last_pos:+d}  ->  {pos_now:+d}")
-                print(f"!!  {snap['signal']}")
-                print("!" * 58 + "\n")
-                subj, body = _format_alert(snap, last_pos)
-                if email_cfg:
-                    try:
-                        send_email_alert(subj, body, email_cfg)
-                        print(f"[email] sent to {len(email_cfg['recipients'])} recipient(s)")
-                    except Exception as ex:
-                        print(f"[email] FAILED: {type(ex).__name__}: {ex}")
-                if tg_cfg:
-                    try:
-                        send_telegram_alert(subj, body, tg_cfg)
-                        print(f"[telegram] sent to chat {tg_cfg['chat_id']}")
-                    except Exception as ex:
-                        print(f"[telegram] FAILED: {type(ex).__name__}: {ex}")
-            last_pos = pos_now
-            _save_state({
-                "position": pos_now,
-                "asof":     snap["asof"],
-                "zscore":   snap["zscore"],
-                "updated":  datetime.now(timezone.utc).isoformat(),
-            })
+            last_pos = _flip_alert_and_save(snap, last_pos, email_cfg, tg_cfg)
 
         # sleep in small chunks so Ctrl-C responds quickly
         slept = 0.0
@@ -903,6 +946,10 @@ def main(argv: list[str] | None = None) -> int:
                    help="print chat IDs that have messaged your bot "
                         "(via getUpdates). Requires TELEGRAM_BOT_TOKEN env var. "
                         "Message your bot first, then run this.")
+    p.add_argument("--once-alert", action="store_true",
+                   help="run a single poll, save state, alert on flip, then "
+                        "exit. Designed for cron / GitHub Actions schedules. "
+                        "Mutually exclusive with --loop.")
     p.add_argument("--test-alert", action="store_true",
                    help="send a test through every configured channel "
                         "(email if SMTP_* env vars set, Telegram if "
@@ -972,6 +1019,16 @@ def main(argv: list[str] | None = None) -> int:
         print("ERROR: --source cmc requires CMC_API_KEY env var or --cmc-key",
               file=sys.stderr)
         return 2
+
+    if args.loop and args.once_alert:
+        print("ERROR: --once-alert and --loop are mutually exclusive.",
+              file=sys.stderr)
+        return 2
+
+    if args.once_alert:
+        return run_once_with_alerts(
+            args.kline, source=args.source, cmc_api_key=args.cmc_key,
+            alert_email=args.alert_email, alert_telegram=args.alert_telegram)
 
     if args.loop:
         return run_loop(args.interval_minutes, args.kline,

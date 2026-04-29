@@ -1,0 +1,79 @@
+name: poll-eth-btc
+
+# Runs the bot once on a cron schedule. Each run:
+#   1. restores the previous run's eth_btc_state.json from the Actions cache
+#   2. installs deps (pip cache makes this ~15s after the first run)
+#   3. runs `python eth_btc_pairs.py --once-alert --kline 1h --alert-telegram`
+#   4. saves the new state file back to the Actions cache so the next run can
+#      detect the next position flip
+#
+# Telegram secrets come from repository Secrets (Settings -> Secrets and
+# variables -> Actions):
+#   TELEGRAM_BOT_TOKEN
+#   TELEGRAM_CHAT_ID
+
+on:
+  schedule:
+    # Every 30 minutes. The signal is on 1h bars so 30-min cadence catches every
+    # flip on the bar after it closes. 30 min keeps total runtime inside the
+    # GitHub Actions free tier (2,000 min/mo) for private repos.
+    - cron: "*/30 * * * *"
+  workflow_dispatch: {}   # lets you click "Run workflow" manually
+  push:
+    branches: [main]      # rerun on every push so config changes take effect
+
+concurrency:
+  group: poll
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  poll:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: requirements.txt
+
+      - name: Restore prior bot state
+        # Pulls the most recent eth-btc-state-* cache entry from any prior
+        # run. The unique `key` ensures every run writes a fresh cache when
+        # the workflow finishes (so state is always up to date).
+        uses: actions/cache@v4
+        with:
+          path: eth_btc_state.json
+          key: eth-btc-state-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: |
+            eth-btc-state-
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run one poll
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID:   ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          python eth_btc_pairs.py --once-alert --kline 1h --alert-telegram
+
+      - name: Upload latest snapshot as artifact (last 30 days)
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: signal-${{ github.run_id }}
+          path: |
+            eth_btc_latest_signal.json
+            eth_btc_state.json
+            eth_btc_trades.csv
+            eth_btc_pairs.png
+          retention-days: 30
+          if-no-files-found: warn
