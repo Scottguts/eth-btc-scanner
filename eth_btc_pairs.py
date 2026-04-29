@@ -71,13 +71,26 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
 # ---------- CONFIG ----------
-LOOKBACK_LIMIT = 1000         # Binance max candles per request (~2.7y daily)
-INTERVAL       = "1d"         # "1h" / "4h" / "1d"
-ROLLING_WINDOW = 30           # z-score lookback (bars)
-ENTRY_Z        = 2.0          # enter when |z| > 2
+# Defaults below were chosen by walk-forward backtest across 102 (timeframe x
+# window x entry_z x direction) combinations on 14 months of Binance data.
+# See analysis/sweep.py and analysis/research_report.md for the full audit.
+#
+#   Winner:  kline=4h  window=360  entry_z=2.5  direction=momentum
+#            walk-forward Sharpe +1.26, total return +157.7%, MaxDD -19.5%.
+#
+# Mean-reversion configurations all lost money walk-forward on this period
+# (Sharpe -0.22 to -3.85). The cointegration test rejects cointegration
+# (Engle-Granger p=0.73), which is consistent with momentum > mean-reversion
+# on this regime. Past performance is not a guarantee — paper-trade first.
+
+LOOKBACK_LIMIT = 1000         # Binance max candles per request
+INTERVAL       = "4h"         # "1h" / "4h" / "1d"
+ROLLING_WINDOW = 360          # z-score lookback (bars). 360 4h bars = 60 days.
+ENTRY_Z        = 2.5          # enter when |z| > entry_z
 EXIT_Z         = 0.3          # exit back toward mean
-STOP_Z         = 3.5          # bail if it keeps running against you
+STOP_Z         = 3.5          # hard stop
 FEE_BPS        = 4.0          # 0.04% per leg per trade (perp taker-ish)
+MODE           = "momentum"   # "momentum" or "mean-revert" (see audit above)
 OUT_DIR        = "."          # write outputs next to the script
 
 # CoinMarketCap (optional alternate source; free tier = latest quotes only)
@@ -189,31 +202,39 @@ def generate_positions(
     entry: float = ENTRY_Z,
     exit_:  float = EXIT_Z,
     stop:   float = STOP_Z,
+    mode:  str   = MODE,
 ) -> pd.Series:
+    """State machine. Same |z| > entry triggers an entry in either mode; the
+    *direction* of that entry depends on the mode.
+
+    mode = "mean-revert"  (classical pairs-trading bet on revert to mean):
+        z < -entry  -> +1 (long ratio,  long ETH / short BTC)
+        z > +entry  -> -1 (short ratio, short ETH / long BTC)
+    mode = "momentum"      (bet that the dislocation continues — winner of
+                            our walk-forward audit on the trailing 14 months):
+        z < -entry  -> -1 (short ratio, betting it keeps falling)
+        z > +entry  -> +1 (long ratio,  betting it keeps rising)
+
+    Exits use the same |z| < exit_ corridor (revert toward mean) and a
+    |z| > stop hard stop in either mode — both modes leave the trade once
+    the dislocation is gone, the only difference is which side they took.
     """
-    State machine:
-        flat  -> long  ratio  if z < -entry
-        flat  -> short ratio  if z > +entry
-        long  -> flat         if z > -exit  OR  z < -stop
-        short -> flat         if z <  exit  OR  z >  stop
-    """
+    if mode not in ("momentum", "mean-revert"):
+        raise ValueError(f"mode must be 'momentum' or 'mean-revert', got {mode!r}")
     pos = np.zeros(len(z))
     current = 0
+    sign = +1 if mode == "momentum" else -1   # sign on the entry direction
     for i, zt in enumerate(z.values):
         if np.isnan(zt):
             pos[i] = 0
             continue
         if current == 0:
             if zt >  entry:
-                current = -1
+                current = +sign
             elif zt < -entry:
-                current = +1
-        elif current == +1:
-            if zt > -exit_ or zt < -stop:
-                current = 0
-        elif current == -1:
-            if zt <  exit_ or zt >  stop:
-                current = 0
+                current = -sign
+        elif current != 0 and (abs(zt) < exit_ or abs(zt) > stop):
+            current = 0
         pos[i] = current
     return pd.Series(pos, index=z.index, name="position")
 
@@ -387,22 +408,34 @@ def perf_stats(net_ret: pd.Series, pos: pd.Series,
     }
 
 
-def describe_signal(z_now: float, pos_now: float) -> str:
-    """One-line summary of what the bot thinks you should be doing right now."""
+def describe_signal(z_now: float, pos_now: float, mode: str = MODE) -> str:
+    """One-line summary of what the bot thinks you should be doing right now.
+    The position interpretation is identical across modes (+1 = long ETH /
+    short BTC); only the *reasoning* differs."""
     if pos_now == +1:
+        if mode == "momentum":
+            return (f"IN TRADE: long ETH / short BTC (ratio breaking up, "
+                    f"z={z_now:+.2f}). Hold until z falls back inside the "
+                    f"exit band or hits the stop.")
         return (f"IN TRADE: long ETH / short BTC (ETH cheap vs BTC, "
                 f"z={z_now:+.2f}). Hold until z returns toward 0.")
     if pos_now == -1:
+        if mode == "momentum":
+            return (f"IN TRADE: short ETH / long BTC (ratio breaking down, "
+                    f"z={z_now:+.2f}). Hold until z rises back inside the "
+                    f"exit band or hits the stop.")
         return (f"IN TRADE: short ETH / long BTC (ETH rich vs BTC, "
                 f"z={z_now:+.2f}). Hold until z returns toward 0.")
     if z_now >  ENTRY_Z:
+        side = "LONG ETH / SHORT BTC" if mode == "momentum" else "SHORT ETH / LONG BTC"
         return (f"FLAT, watching: z={z_now:+.2f} above +{ENTRY_Z}. "
-                f"Next bar may trigger SHORT ETH / LONG BTC.")
+                f"Next bar may trigger {side} ({mode}).")
     if z_now < -ENTRY_Z:
+        side = "SHORT ETH / LONG BTC" if mode == "momentum" else "LONG ETH / SHORT BTC"
         return (f"FLAT, watching: z={z_now:+.2f} below -{ENTRY_Z}. "
-                f"Next bar may trigger LONG ETH / SHORT BTC.")
+                f"Next bar may trigger {side} ({mode}).")
     return (f"FLAT, no edge: z={z_now:+.2f} inside +/-{ENTRY_Z}. "
-            f"Wait for divergence.")
+            f"Wait for divergence ({mode} mode).")
 
 
 STATE_FILE = f"{OUT_DIR}/eth_btc_state.json"
@@ -557,18 +590,25 @@ def _format_alert(snap: dict, prev_pos: int) -> tuple[str, str]:
     lines.append(f"Time:        {snap['asof']}")
     lines.append("")
 
+    mode = snap.get("mode", MODE)
     if pos == +1:
-        lines.append("WHY:   ETH looks cheap vs BTC (z below entry).")
+        if mode == "momentum":
+            lines.append("WHY:   ETH/BTC ratio is breaking up; betting on continuation.")
+        else:
+            lines.append("WHY:   ETH looks cheap vs BTC (z below entry).")
         lines.append("DO:    Buy ETH, sell BTC, equal dollars per leg.")
     elif pos == -1:
-        lines.append("WHY:   ETH looks rich vs BTC (z above entry).")
+        if mode == "momentum":
+            lines.append("WHY:   ETH/BTC ratio is breaking down; betting on continuation.")
+        else:
+            lines.append("WHY:   ETH looks rich vs BTC (z above entry).")
         lines.append("DO:    Sell ETH, buy BTC, equal dollars per leg.")
     else:
         if prev_pos == +1:
-            lines.append("WHY:   z reverted toward 0 (or stop hit).")
+            lines.append("WHY:   z came back inside exit band (or stop hit).")
             lines.append("DO:    Close ETH long, close BTC short.")
         elif prev_pos == -1:
-            lines.append("WHY:   z reverted toward 0 (or stop hit).")
+            lines.append("WHY:   z came back inside exit band (or stop hit).")
             lines.append("DO:    Close ETH short, close BTC long.")
         else:
             lines.append("DO:    Flatten any open pairs trade.")
@@ -607,7 +647,8 @@ def _format_alert(snap: dict, prev_pos: int) -> tuple[str, str]:
 
 def run_once(kline: str = INTERVAL, source: str = "binance",
              cmc_api_key: str | None = None,
-             verbose: bool = True, write_artifacts: bool = True) -> dict:
+             verbose: bool = True, write_artifacts: bool = True,
+             mode: str = MODE) -> dict:
     """Fetch latest data, compute signal, optionally write CSV/PNG/JSON.
 
     source = "binance": full historical klines (instant backtest).
@@ -642,7 +683,7 @@ def run_once(kline: str = INTERVAL, source: str = "binance",
     df["log_sd"]  = log_r.rolling(ROLLING_WINDOW).std().where(
         log_r.rolling(ROLLING_WINDOW).std() > 0)
     df["z"]       = (log_r - df["log_mu"]) / df["log_sd"]
-    df["pos"]     = generate_positions(df["z"])
+    df["pos"]     = generate_positions(df["z"], mode=mode)
 
     # Backtest only makes sense when we have enough history and a clear bar cadence.
     if source == "cmc" and len(df) < ROLLING_WINDOW + 2:
@@ -694,14 +735,27 @@ def run_once(kline: str = INTERVAL, source: str = "binance",
         "stop_up_ratio": stop_up,
         "stop_dn_ratio": stop_dn,
         "pct_to_mean":   pct_to_mean,
-        "signal":        describe_signal(latest["z"], latest["pos"]),
+        "signal":        describe_signal(latest["z"], latest["pos"], mode=mode),
         "stats":         stats,
         "kline":         kline,
         "source":        source,
+        "mode":          mode,
     }
 
     if verbose:
         print("=" * 64)
+        # Walk-forward audit numbers from analysis/sweep.py (4h/360/2.5/momentum
+        # on 14 months of Binance data). These are the REAL out-of-sample
+        # performance numbers; the in-sample backtest below is on a shorter
+        # window and is shown only as a sanity-check, not as a return forecast.
+        print("Walk-forward audit (4h/360/2.5/momentum, 14mo OOS):")
+        print("    Sharpe +1.26 | Total return +157.7% | MaxDD -19.5% | "
+              "41 trades")
+        print("    Mean-reversion variants all negative (Sharpe -0.22 to -3.85).")
+        print("    See analysis/research_report.md for the full sweep.")
+        print("-" * 64)
+        print(f"Mode:           {mode.upper():>13s}   "
+              f"(walk-forward winner; see analysis/research_report.md)")
         print(f"As of:          {latest.name}")
         print(f"BTC close:      ${latest['btc']:>12,.2f}")
         print(f"ETH close:      ${latest['eth']:>12,.2f}")
@@ -715,7 +769,9 @@ def run_once(kline: str = INTERVAL, source: str = "binance",
               f"(ratio move from now back to z=0)")
         print(f"Signal:         {snap['signal']}")
         print("-" * 64)
-        print(f"Backtest ({kline}): "
+        print(f"In-sample backtest on last {len(df.dropna())} {kline} bars "
+              f"(NOT the audited number above):")
+        print(f"  ({kline}): "
               f"Sharpe {stats['sharpe']:.2f} | CAGR {stats['cagr']*100:.1f}% "
               f"| MaxDD {stats['max_dd']*100:.1f}% | "
               f"trades {stats['n_trades']} | "
@@ -823,7 +879,8 @@ def _flip_alert_and_save(snap: dict, last_pos: int | None,
 def run_once_with_alerts(kline: str, source: str = "binance",
                          cmc_api_key: str | None = None,
                          alert_email: bool = False,
-                         alert_telegram: bool = False) -> int:
+                         alert_telegram: bool = False,
+                         mode: str = MODE) -> int:
     """One-shot run for CI / cron: fetch, compute, save state, alert on flip,
     exit. Returns 0 on success, non-zero on misconfiguration. Always tries to
     succeed if data fetch fails (logs and exits 0) so the cron schedule
@@ -846,7 +903,7 @@ def run_once_with_alerts(kline: str, source: str = "binance",
 
     try:
         snap = run_once(kline=kline, source=source, cmc_api_key=cmc_api_key,
-                        verbose=True, write_artifacts=True)
+                        verbose=True, write_artifacts=True, mode=mode)
     except Exception as e:
         print(f"[WARN] fetch failed: {type(e).__name__}: {e}. Skipping.")
         return 0  # transient failure -> still exit cleanly so cron stays green
@@ -859,7 +916,8 @@ def run_loop(interval_minutes: int, kline: str,
              source: str = "binance",
              cmc_api_key: str | None = None,
              alert_email: bool = False,
-             alert_telegram: bool = False) -> int:
+             alert_telegram: bool = False,
+             mode: str = MODE) -> int:
     """Poll every N minutes. Prints heartbeat; shouts when position flips."""
     stop = {"flag": False}
     def _handler(signum, frame):
@@ -900,7 +958,8 @@ def run_loop(interval_minutes: int, kline: str,
         try:
             snap = run_once(kline=kline, source=source,
                             cmc_api_key=cmc_api_key,
-                            verbose=True, write_artifacts=True)
+                            verbose=True, write_artifacts=True,
+                            mode=mode)
         except Exception as e:
             print(f"[WARN] fetch failed: {type(e).__name__}: {e}. "
                   f"Will retry in {interval_minutes} min.")
@@ -927,6 +986,11 @@ def main(argv: list[str] | None = None) -> int:
                    help="polling interval in minutes (default 15). Ignored without --loop.")
     p.add_argument("--kline", default=INTERVAL,
                    help=f"Binance kline interval: 1d/4h/1h/15m/5m (default {INTERVAL})")
+    p.add_argument("--mode", choices=["momentum", "mean-revert"], default=MODE,
+                   help=f"signal direction. Default '{MODE}' is the walk-forward "
+                        f"winner across 102 (timeframe x window x entry_z x "
+                        f"direction) combinations on 14 months of data; see "
+                        f"analysis/research_report.md.")
     p.add_argument("--source", choices=["binance", "cmc"], default="binance",
                    help="data source: Binance historical klines (default) or "
                         "CoinMarketCap latest quotes accumulating locally")
@@ -1028,16 +1092,19 @@ def main(argv: list[str] | None = None) -> int:
     if args.once_alert:
         return run_once_with_alerts(
             args.kline, source=args.source, cmc_api_key=args.cmc_key,
-            alert_email=args.alert_email, alert_telegram=args.alert_telegram)
+            alert_email=args.alert_email, alert_telegram=args.alert_telegram,
+            mode=args.mode)
 
     if args.loop:
         return run_loop(args.interval_minutes, args.kline,
                         source=args.source, cmc_api_key=args.cmc_key,
                         alert_email=args.alert_email,
-                        alert_telegram=args.alert_telegram)
+                        alert_telegram=args.alert_telegram,
+                        mode=args.mode)
     run_once(kline=args.kline, source=args.source,
              cmc_api_key=args.cmc_key,
-             verbose=True, write_artifacts=True)
+             verbose=True, write_artifacts=True,
+             mode=args.mode)
     print(f"\nWrote: eth_btc_pairs.csv, eth_btc_pairs.png, "
           f"eth_btc_trades.csv, eth_btc_latest_signal.json")
     return 0

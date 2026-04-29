@@ -63,7 +63,9 @@ jobs:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID:   ${{ secrets.TELEGRAM_CHAT_ID }}
         run: |
-          python eth_btc_pairs.py --once-alert --kline 1h --alert-telegram
+          # 4h bars, momentum mode, 360-bar window, entry_z 2.5 — winning config
+          # from the walk-forward sweep. See analysis/research_report.md.
+          python eth_btc_pairs.py --once-alert --kline 4h --mode momentum --alert-telegram
 
       - name: Upload latest snapshot as artifact (last 30 days)
         uses: actions/upload-artifact@v4

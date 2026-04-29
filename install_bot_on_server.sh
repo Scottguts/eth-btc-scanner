@@ -88,8 +88,9 @@ fi
 # Telegram token there.
 # shellcheck disable=SC1090
 set -a; source "$ENV_FILE_DST"; set +a
-INTERVAL_MINUTES="${INTERVAL_MINUTES:-15}"
-KLINE="${KLINE:-1h}"
+INTERVAL_MINUTES="${INTERVAL_MINUTES:-30}"
+KLINE="${KLINE:-4h}"
+MODE="${MODE:-momentum}"
 
 echo
 echo "==> Creating systemd service..."
@@ -103,7 +104,7 @@ Wants=network-online.target
 Type=simple
 WorkingDirectory=$BOT_DIR
 EnvironmentFile=$ENV_FILE_DST
-ExecStart=/usr/bin/python3 $BOT_DIR/eth_btc_pairs.py --loop --interval-minutes $INTERVAL_MINUTES --kline $KLINE --alert-telegram
+ExecStart=/usr/bin/python3 $BOT_DIR/eth_btc_pairs.py --loop --interval-minutes $INTERVAL_MINUTES --kline $KLINE --mode $MODE --alert-telegram
 Restart=always
 RestartSec=30
 StandardOutput=append:$BOT_DIR/bot.log

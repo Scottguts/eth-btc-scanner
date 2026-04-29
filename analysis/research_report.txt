@@ -1,0 +1,24 @@
+ETH/BTC research summary
+============================================================
+Data: 12999 1h bars, 2024-11-04 03:59:59.999000+00:00 -> 2026-04-29 17:59:59.999000+00:00
+
+Stationarity / cointegration:
+  ADF on log(ETH/BTC):  p=0.5330  -> non-stationary at 5%
+  Engle-Granger:         p=0.7270  gamma=1.2379  -> not cointegrated at 5%
+
+Hedge-ratio summary (30-day rolling):
+  beta (cov/var on log returns): median=1.178
+  gamma (EG slope):              median=1.495
+
+Walk-forward backtest results:
+  train=2160 bars, test=720 bars, fees=4.0 bps/leg
+
+  variant                           Sharpe  CAGR%  MaxDD%  Hit%  Trades  Time%  TotRet%
+  z+dollar (current bot)            -3.57  -65.9   -81.0  47.9    625  38.5   -79.76
+  z+beta-weighted                   -3.85  -67.9   -82.7  48.1    625  38.5   -81.46
+  z+cointegration-weighted          -3.10  -70.4   -84.8  48.4    625  38.5   -83.54
+  z+gamma+ML-gate                   -2.65  -60.1   -76.5  48.4    559  30.3   -74.46
+
+HistGBM OOS AUC across 5 folds: mean=0.397 median=0.478
+
+WINNER (by walk-forward Sharpe): z+gamma+ML-gate

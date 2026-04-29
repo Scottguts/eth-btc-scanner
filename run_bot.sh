@@ -25,8 +25,9 @@ else
     exit 1
 fi
 
-INTERVAL_MINUTES="${INTERVAL_MINUTES:-15}"
-KLINE="${KLINE:-1h}"
+INTERVAL_MINUTES="${INTERVAL_MINUTES:-30}"
+KLINE="${KLINE:-4h}"
+MODE="${MODE:-momentum}"
 
 PY=/usr/local/bin/python3
 [ -x "$PY" ] || PY=/Library/Frameworks/Python.framework/Versions/3.13/bin/python3.13
@@ -38,4 +39,5 @@ exec /usr/bin/caffeinate -i -s "$PY" -u "$BOT_DIR/eth_btc_pairs.py" \
     --loop \
     --interval-minutes "$INTERVAL_MINUTES" \
     --kline "$KLINE" \
+    --mode "$MODE" \
     --alert-telegram

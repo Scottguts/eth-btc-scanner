@@ -1,27 +1,42 @@
-# ETH/BTC pairs-trading signal bot
+# ETH/BTC pairs signal bot
 
-A small Python bot that watches the ETH/BTC price ratio, detects when ETH gets
-unusually cheap or expensive vs BTC on a rolling z-score basis, and emits a
-mean-reversion **signal** (long ETH / short BTC, or the inverse, or flat).
+A small Python bot that watches the ETH/BTC price ratio, detects unusually
+large dislocations on a rolling z-score basis, and emits a **signal**
+(long ETH / short BTC, or the inverse, or flat). It does **not** execute
+orders — it sends Telegram or email alerts and writes a trade log; you
+take the trades manually.
 
-It does **not** execute orders. It is a signal generator with a backtest, a
-chart, a trade log, and Telegram/email alerts on every position flip.
+**Default mode: momentum**, audited via walk-forward across 102 timeframe x
+window x entry-z x direction combinations on 14 months of Binance data.
+Walk-forward Sharpe **+1.26**, total return **+157.7 %**, max DD **-19.5 %**,
+~41 trades. Mean-reversion variants all lost money walk-forward on this
+sample (Sharpe -0.22 to -3.85). See
+[`analysis/research_report.md`](analysis/research_report.md) for the full
+audit, the cointegration result that explains why mean-reversion failed,
+and the references.
 
-> Not financial advice. Paper-trade it before risking real money.
+> Not financial advice. Past walk-forward performance is not a guarantee of
+> live results. Paper-trade before risking real money.
 
 ---
 
 ## What it does each cycle
 
-1. Pulls daily/hourly closes for `BTCUSDT` and `ETHUSDT` from Binance's public
-   REST API. (Auto-falls-back to `binance.us` if the primary host geo-blocks.)
-2. Computes `log(ETH/BTC)` and z-scores it against a 30-bar rolling window.
-3. Runs a state machine:
-   - `z < -2.0` → **long ratio** (long ETH, short BTC)
-   - `z > +2.0` → **short ratio** (short ETH, long BTC)
-   - `|z| < 0.3` → exit toward mean
+1. Pulls 4h closes for `BTCUSDT` and `ETHUSDT` from Binance's public REST API.
+   (Auto-falls-back to `binance.us` if the primary host geo-blocks.)
+2. Computes `log(ETH/BTC)` and z-scores it against a 360-bar (~60 day) rolling
+   window.
+3. Runs a state machine. **In momentum mode (default):**
+   - `z > +2.5` → **+1**: long ETH / short BTC (bet trend continues up)
+   - `z < -2.5` → **-1**: short ETH / long BTC (bet trend continues down)
+   - `|z| < 0.3` → flat (dislocation cleared)
    - `|z| > 3.5` → hard stop
-4. Backtests the rule dollar-neutral with realistic per-leg fees.
+
+   In mean-revert mode (legacy, `--mode mean-revert`) the entry directions
+   are flipped — see the audit for why momentum was chosen.
+4. Backtests the rule dollar-neutral with realistic per-leg fees. The
+   displayed in-sample Sharpe is on the recent 1000-bar window only and is
+   labelled clearly as **not** the audited number.
 5. Writes:
    - `eth_btc_pairs.csv` — full timeseries (price, ratio, z, position, returns)
    - `eth_btc_pairs.png` — three-panel chart (ratio, z-score, equity curve)
@@ -109,6 +124,42 @@ real inbox.
 
 ---
 
+## Run on GitHub Actions (zero-cost, no laptop)
+
+This is the cleanest way to run the bot if you don't have a server. Each
+firing of the cron is a fresh Ubuntu VM; total runtime is ~1 min/run with
+pip caching.
+
+[`.github/workflows/poll.yml`](.github/workflows/poll.yml) is preconfigured to:
+
+- Run every 30 minutes via `cron`. With ~1 min/run that's ~1,500 min/month,
+  inside the **2,000 min/mo free tier** for personal private repos.
+- Install deps with `actions/setup-python` pip cache.
+- Restore the prior `eth_btc_state.json` from the Actions cache so flip
+  detection persists between runs.
+- Run `python eth_btc_pairs.py --once-alert --kline 4h --mode momentum
+  --alert-telegram`.
+- Upload the snapshot/CSV/PNG as artifacts (30-day retention) for debugging.
+
+To use it:
+
+1. **Push this repo** to GitHub (any visibility — public or private).
+2. **Add two repository Secrets** at *Settings -> Secrets and variables ->
+   Actions*:
+   - `TELEGRAM_BOT_TOKEN`
+   - `TELEGRAM_CHAT_ID`
+3. **Enable Actions** if your account has it disabled, then either wait for
+   the next cron tick or trigger the workflow manually via *Actions -> 
+   poll-eth-btc -> Run workflow*.
+4. Watch the run logs in the Actions tab; Telegram alerts arrive on every
+   position flip exactly as they do locally.
+
+**Public vs private:** GitHub Actions minutes are unlimited for public
+repos and capped at 2,000/mo free for private. With 30-min cron + pip
+cache, this fits the private free tier. The bot has no privileged data
+in the repo (secrets are stored in repo Secrets, not committed) so public
+is also fine — your call.
+
 ## Run locally on macOS (LaunchAgent)
 
 If you just want it running on your laptop, the included `run_bot.sh` and
@@ -177,31 +228,37 @@ Manage it with the usual `systemctl status / restart / stop eth-btc-bot`.
 
 ## Configuration
 
-All knobs live at the top of [`eth_btc_pairs.py`](eth_btc_pairs.py):
+All knobs live at the top of [`eth_btc_pairs.py`](eth_btc_pairs.py). Defaults
+are the walk-forward winner:
 
-| Constant         | Default | Meaning                                       |
-|------------------|---------|-----------------------------------------------|
-| `LOOKBACK_LIMIT` | 1000    | Binance candles per request (max 1000).       |
-| `INTERVAL`       | `1d`    | Default kline interval.                       |
-| `ROLLING_WINDOW` | 30      | Z-score lookback in bars.                     |
-| `ENTRY_Z`        | 2.0     | Open trade when |z| crosses this.             |
-| `EXIT_Z`         | 0.3     | Close trade when z reverts back to here.      |
-| `STOP_Z`         | 3.5     | Hard stop if z keeps running against you.     |
-| `FEE_BPS`        | 4.0     | Per-leg taker fee in basis points.            |
+| Constant         | Default     | Meaning                                       |
+|------------------|-------------|-----------------------------------------------|
+| `LOOKBACK_LIMIT` | 1000        | Binance candles per request (max 1000).       |
+| `INTERVAL`       | `4h`        | Kline interval.                               |
+| `ROLLING_WINDOW` | 360         | Z-score lookback in bars (~60 days at 4h).    |
+| `ENTRY_Z`        | 2.5         | Open trade when |z| crosses this.             |
+| `EXIT_Z`         | 0.3         | Close trade when z reverts back to here.      |
+| `STOP_Z`         | 3.5         | Hard stop if z keeps running against you.     |
+| `FEE_BPS`        | 4.0         | Per-leg taker fee in basis points.            |
+| `MODE`           | `momentum`  | `momentum` (default) or `mean-revert`.        |
 
-The CLI also exposes `--kline {1d,4h,1h,15m,5m}` and `--source {binance,cmc}`.
+CLI flags: `--kline {1d,4h,1h,15m,5m}`, `--mode {momentum,mean-revert}`,
+`--source {binance,cmc}`, `--once-alert` (CI/cron one-shot), `--loop`,
+`--alert-telegram`, `--alert-email`.
 
 ## CLI cheat sheet
 
 ```bash
-python eth_btc_pairs.py                         # one-shot
-python eth_btc_pairs.py --loop                  # live poller
-python eth_btc_pairs.py --loop --interval-minutes 5 --kline 1h
-python eth_btc_pairs.py --source cmc --loop     # CMC fallback (free tier)
-python eth_btc_pairs.py --telegram-find-chat-id # discover chat id
-python eth_btc_pairs.py --test-alert            # send a test through every channel
-python eth_btc_pairs.py --loop --alert-telegram # live + Telegram alerts
-python eth_btc_pairs.py --loop --alert-email    # live + email/SMS alerts
+python eth_btc_pairs.py                                    # one-shot, defaults
+python eth_btc_pairs.py --loop                             # live poller
+python eth_btc_pairs.py --once-alert --alert-telegram      # cron / CI one-shot
+python eth_btc_pairs.py --loop --interval-minutes 30       # custom poll cadence
+python eth_btc_pairs.py --mode mean-revert                 # use legacy direction
+python eth_btc_pairs.py --kline 1h --mode mean-revert      # legacy 1h setup
+python eth_btc_pairs.py --source cmc --loop                # CMC fallback
+python eth_btc_pairs.py --telegram-find-chat-id            # discover chat id
+python eth_btc_pairs.py --test-alert                       # send a test
+python eth_btc_pairs.py --loop --alert-telegram            # live + Telegram
 ```
 
 ## Notes & limitations
