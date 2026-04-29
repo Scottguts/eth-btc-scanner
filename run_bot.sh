@@ -27,7 +27,7 @@ fi
 
 INTERVAL_MINUTES="${INTERVAL_MINUTES:-30}"
 KLINE="${KLINE:-4h}"
-MODE="${MODE:-momentum}"
+MODE="${MODE:-auto}"
 
 PY=/usr/local/bin/python3
 [ -x "$PY" ] || PY=/Library/Frameworks/Python.framework/Versions/3.13/bin/python3.13

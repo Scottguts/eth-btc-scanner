@@ -90,7 +90,7 @@ fi
 set -a; source "$ENV_FILE_DST"; set +a
 INTERVAL_MINUTES="${INTERVAL_MINUTES:-30}"
 KLINE="${KLINE:-4h}"
-MODE="${MODE:-momentum}"
+MODE="${MODE:-auto}"
 
 echo
 echo "==> Creating systemd service..."

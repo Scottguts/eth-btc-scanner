@@ -271,6 +271,79 @@ python analysis/sweep.py       # ~3-5 min the first time, fast after (csv cache)
 
 ---
 
+## v2 update — regime detector + ML overlay + vol-target
+
+After the initial audit landed, we built three v2 components on top:
+
+1. **Regime detector** ([`regime.py`](regime.py)). Hurst exponent (R/S
+   estimator on log-spread) + rolling Augmented Dickey-Fuller p-value, both
+   computed on a 240-bar (~40 day) rolling window. A bar is flagged
+   `momentum` when both H ≥ 0.53 and ADF p > 0.15; `mean-revert` when
+   both H ≤ 0.47 and ADF p < 0.08; otherwise `indeterminate`. A
+   4-bar hysteresis stops the label from flapping. Used by the bot's
+   `--mode auto` (now the default) to pick direction per entry.
+
+2. **Feature library + ML overlay** ([`features.py`](features.py),
+   [`v2_backtest.py`](v2_backtest.py)). 40 engineered features across
+   multiple horizons (lagged returns 1/3/6/12/24/72 bars, rolling vol,
+   per-leg momentum/vol, RSI 14/42, Bollinger %B, ATR, volume regime,
+   regime indicators). Walk-forward HistGradientBoostingClassifier with
+   3-month train / 1-month test windows. The final fold's model is
+   pickled to [`model.pkl`](model.pkl) for the live bot.
+
+3. **Vol-targeted position sizer** (`vol_target_size` in
+   [`v2_backtest.py`](v2_backtest.py)). Targets 1.5 % daily vol on the
+   spread, locks size at entry, never rebalances mid-trade (mid-trade
+   rebalancing was the cause of a -45 bp Sharpe regression in the first
+   iteration).
+
+### Walk-forward results, 5,999 4h bars (Aug-2023 → Apr-2026)
+
+| Variant                                                  | Sharpe | CAGR % | MaxDD % | Trades | TotRet % |
+|:---------------------------------------------------------|-------:|-------:|--------:|-------:|---------:|
+| v1: momentum / dollar / no ML                            | +0.81  | +26.9  | -25.6   | 62     | +92.22   |
+| **v2a: regime-aware / dollar / no ML  (LIVE)**           | **+0.81** | **+26.9** | **-25.6** | **62** | **+92.22** |
+| v2b: regime / dollar / ML hard-gate (threshold 0.50)     | -0.68  | -8.8   | -28.3   | 18     | -22.37   |
+| v2c: regime / ML proba-sized position                    | -0.22  | -5.0   | -27.1   | 19     | -13.15   |
+| v2d: regime / ML proba-size / vol-target (full stack)    | -0.24  | -4.1   | -22.1   | 19     | -10.92   |
+
+ML walk-forward AUC: **mean 0.569, median 0.604** across 20 folds. The
+classifier has a real edge over random (AUC > 0.5) but it is not strong
+enough to dominate the bare momentum signal — gating or sizing on it
+discards trades that turn out to be net-positive in aggregate.
+
+### What we shipped (and why)
+
+- **Regime detector ON** (`--mode auto`, default). Currently resolves to
+  `momentum` 100 % of the time on this 32-month sample (Hurst 0.92-0.97,
+  ADF p 0.10-0.20, both clearly in the trending bucket). The detector is
+  shipped *for future regime changes*: if ETH/BTC enters a range-bound
+  period, it will start producing `mean-revert` labels and the bot will
+  flip direction automatically.
+- **ML overlay OFF** by default; available via `--use-ml`. Even at
+  AUC 0.57-0.60 the overlay vetoes too many net-positive entries on this
+  sample. Kept around because (a) regime / vol changes can flip its
+  utility, and (b) it's a useful "second opinion" check to manually
+  consult on a given entry.
+- **Vol-targeting OFF** by default. With size locked at entry the
+  Sharpe is approximately invariant to size choice; we leave the
+  knob unconnected for now to keep the alert output simple.
+- The shipped sample has a slightly lower walk-forward Sharpe (+0.81)
+  than the headline figure from the first sweep (+1.26). The
+  difference is the test universe: the first sweep tested only 3,600
+  of 5,999 bars (long train, fewer folds); v2 tests 5,400 bars
+  (~30 folds) and is therefore the more conservative estimate to trust.
+
+### Reproducing
+
+```bash
+python analysis/sweep.py          # parameter grid (~3 min)
+python analysis/research.py       # cointegration + dollar/beta/gamma compare
+python analysis/v2_backtest.py    # regime + ML walk-forward; saves model.pkl
+```
+
+---
+
 ## References (load-bearing for the design decisions above)
 
 - Engle, R. F. and Granger, C. W. J. (1987), "Co-integration and Error

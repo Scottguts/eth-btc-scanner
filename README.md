@@ -6,14 +6,24 @@ large dislocations on a rolling z-score basis, and emits a **signal**
 orders — it sends Telegram or email alerts and writes a trade log; you
 take the trades manually.
 
-**Default mode: momentum**, audited via walk-forward across 102 timeframe x
-window x entry-z x direction combinations on 14 months of Binance data.
-Walk-forward Sharpe **+1.26**, total return **+157.7 %**, max DD **-19.5 %**,
-~41 trades. Mean-reversion variants all lost money walk-forward on this
-sample (Sharpe -0.22 to -3.85). See
-[`analysis/research_report.md`](analysis/research_report.md) for the full
-audit, the cointegration result that explains why mean-reversion failed,
-and the references.
+**Default mode: `auto`** — the v2 regime detector (Hurst exponent +
+rolling Augmented Dickey-Fuller test on the log-spread) picks the entry
+direction (momentum vs mean-revert) per entry, so the bot adapts if the
+ETH/BTC regime shifts. On the audited 32 months of 4h data the regime
+is 100 % momentum, so `auto` currently behaves identically to `momentum`
+(walk-forward Sharpe **+0.81**, total return **+92.2 %**, MaxDD
+**-25.6 %**, 62 trades). Mean-reversion variants of the same z-signal
+were Sharpe **-0.22 to -3.85** in walk-forward — the cointegration test
+(Engle-Granger p=0.73) rejects cointegration so the textbook pairs-
+trading bet on revert-to-mean has no theoretical foundation in this
+period.
+
+A walk-forward HistGradientBoosting classifier (sklearn) is trained on
+40 engineered features and shipped as [`analysis/model.pkl`](analysis/model.pkl);
+its OOS AUC is **0.57-0.60** across 20 folds — a real edge over random,
+but not strong enough to gate or size the base signal profitably on the
+audited sample, so it is **opt-in** via `--use-ml`. Full audit:
+[`analysis/research_report.md`](analysis/research_report.md).
 
 > Not financial advice. Past walk-forward performance is not a guarantee of
 > live results. Paper-trade before risking real money.

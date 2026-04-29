@@ -63,9 +63,12 @@ jobs:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID:   ${{ secrets.TELEGRAM_CHAT_ID }}
         run: |
-          # 4h bars, momentum mode, 360-bar window, entry_z 2.5 — winning config
-          # from the walk-forward sweep. See analysis/research_report.md.
-          python eth_btc_pairs.py --once-alert --kline 4h --mode momentum --alert-telegram
+          # 4h bars, auto regime detector + 360-bar window, entry_z 2.5.
+          # Auto mode uses the v2 Hurst+ADF regime detector to pick momentum
+          # vs mean-revert per entry. Currently resolves to momentum on the
+          # audited 32-month sample. See analysis/research_report.md and
+          # analysis/v2_report.txt.
+          python eth_btc_pairs.py --once-alert --kline 4h --mode auto --alert-telegram
 
       - name: Upload latest snapshot as artifact (last 30 days)
         uses: actions/upload-artifact@v4

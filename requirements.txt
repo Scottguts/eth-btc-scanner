@@ -2,3 +2,7 @@ requests>=2.31
 pandas>=2.0
 numpy>=1.24
 matplotlib>=3.7
+
+# v2: regime detector (statsmodels) and ML overlay (sklearn).
+statsmodels>=0.14
+scikit-learn>=1.3

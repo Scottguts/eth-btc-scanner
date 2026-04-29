@@ -60,6 +60,7 @@ from datetime import datetime, timezone, timedelta
 
 import smtplib
 import ssl as _ssl
+import pickle
 from email.mime.text import MIMEText
 from email.utils import formatdate, make_msgid
 
@@ -69,6 +70,18 @@ import requests
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+
+# v2 components live in the analysis/ package alongside training and audit
+# scripts. They are imported lazily / optionally so the bot still runs
+# (without auto-regime / ML overlay) on a stripped install.
+try:
+    sys.path.insert(0, os.path.join(os.path.dirname(__file__), "analysis"))
+    from regime import detect_regime, RegimeBands  # type: ignore
+    from features import build_features  # type: ignore
+    _V2_AVAILABLE = True
+except Exception as _v2_err:  # pragma: no cover - best-effort import
+    _V2_AVAILABLE = False
+    _V2_IMPORT_ERR = _v2_err
 
 # ---------- CONFIG ----------
 # Defaults below were chosen by walk-forward backtest across 102 (timeframe x
@@ -90,8 +103,15 @@ ENTRY_Z        = 2.5          # enter when |z| > entry_z
 EXIT_Z         = 0.3          # exit back toward mean
 STOP_Z         = 3.5          # hard stop
 FEE_BPS        = 4.0          # 0.04% per leg per trade (perp taker-ish)
-MODE           = "momentum"   # "momentum" or "mean-revert" (see audit above)
+MODE           = "auto"       # "auto" (default; regime detector picks),
+                              # "momentum", or "mean-revert".
 OUT_DIR        = "."          # write outputs next to the script
+
+# v2 model path (saved by analysis/v2_backtest.py). Used only when --use-ml
+# is passed.
+ML_MODEL_PATH  = os.path.join(os.path.dirname(__file__),
+                              "analysis", "model.pkl")
+ML_THRESHOLD   = 0.50         # below this we veto an entry (--use-ml only)
 
 # CoinMarketCap (optional alternate source; free tier = latest quotes only)
 CMC_BASE       = "https://pro-api.coinmarketcap.com"
@@ -180,9 +200,14 @@ def fetch_klines(symbol: str, interval: str, limit: int = 1000) -> pd.DataFrame:
         cols = ["openTime", "open", "high", "low", "close", "volume",
                 "closeTime", "qav", "trades", "tbav", "tbqv", "ignore"]
         df = pd.DataFrame(rows, columns=cols)
-        df["time"]  = pd.to_datetime(df["closeTime"], unit="ms", utc=True)
-        df["close"] = df["close"].astype(float)
-        return df.set_index("time")[["close"]].rename(columns={"close": symbol})
+        df["time"]   = pd.to_datetime(df["closeTime"], unit="ms", utc=True)
+        df["close"]  = df["close"].astype(float)
+        df["volume"] = df["volume"].astype(float)
+        # Volume is needed by the v2 ML feature builder; safe to ignore
+        # downstream when --use-ml is off.
+        return (df.set_index("time")[["close", "volume"]]
+                  .rename(columns={"close": symbol,
+                                   "volume": f"{symbol}_vol"}))
 
     raise last_err or RuntimeError("all Binance endpoints failed")
 
@@ -203,32 +228,56 @@ def generate_positions(
     exit_:  float = EXIT_Z,
     stop:   float = STOP_Z,
     mode:  str   = MODE,
+    regime: pd.Series | None = None,
 ) -> pd.Series:
-    """State machine. Same |z| > entry triggers an entry in either mode; the
-    *direction* of that entry depends on the mode.
+    """State machine. Same |z| > entry triggers an entry in any mode; the
+    *direction* of that entry depends on the mode (or, in "auto" mode, on
+    the regime label at the bar where we go from flat to active).
 
-    mode = "mean-revert"  (classical pairs-trading bet on revert to mean):
+    mode = "mean-revert"  (classical pairs-trading; bet on revert to mean):
         z < -entry  -> +1 (long ratio,  long ETH / short BTC)
         z > +entry  -> -1 (short ratio, short ETH / long BTC)
-    mode = "momentum"      (bet that the dislocation continues — winner of
-                            our walk-forward audit on the trailing 14 months):
+    mode = "momentum"      (bet that the dislocation continues; current default
+                            on the audited 32-month sample):
         z < -entry  -> -1 (short ratio, betting it keeps falling)
         z > +entry  -> +1 (long ratio,  betting it keeps rising)
+    mode = "auto"          (regime detector picks momentum or mean-revert per
+                            entry; "indeterminate" regime stays flat). Requires
+                            `regime` series aligned to z.
 
-    Exits use the same |z| < exit_ corridor (revert toward mean) and a
-    |z| > stop hard stop in either mode — both modes leave the trade once
-    the dislocation is gone, the only difference is which side they took.
+    Exits use the same |z| < exit_ corridor and |z| > stop hard stop in all
+    modes; only the entry direction varies.
     """
-    if mode not in ("momentum", "mean-revert"):
-        raise ValueError(f"mode must be 'momentum' or 'mean-revert', got {mode!r}")
+    if mode not in ("momentum", "mean-revert", "auto"):
+        raise ValueError(f"mode must be 'momentum'/'mean-revert'/'auto', "
+                         f"got {mode!r}")
+    if mode == "auto" and regime is None:
+        raise ValueError("mode='auto' requires a regime series")
+
     pos = np.zeros(len(z))
     current = 0
-    sign = +1 if mode == "momentum" else -1   # sign on the entry direction
-    for i, zt in enumerate(z.values):
+    z_vals = z.values
+    r_vals = regime.values if regime is not None else None
+    # 'last_sign' lets us hold a trade through a regime change in the middle
+    # of a position (don't yank a trade just because the regime label flipped
+    # mid-bar; only fresh entries respect the new regime).
+    for i in range(len(z)):
+        zt = z_vals[i]
         if np.isnan(zt):
-            pos[i] = 0
+            pos[i] = current
             continue
         if current == 0:
+            if mode == "auto":
+                reg = r_vals[i] if r_vals is not None else "indeterminate"
+                if reg == "momentum":
+                    sign = +1
+                elif reg == "mean-revert":
+                    sign = -1
+                else:
+                    pos[i] = 0
+                    continue
+            else:
+                sign = +1 if mode == "momentum" else -1
             if zt >  entry:
                 current = +sign
             elif zt < -entry:
@@ -237,6 +286,65 @@ def generate_positions(
             current = 0
         pos[i] = current
     return pd.Series(pos, index=z.index, name="position")
+
+
+# ---------- v2 ML gate (optional) ----------
+
+_ML_BUNDLE_CACHE: dict | None = None
+
+
+def _load_ml_bundle(path: str = ML_MODEL_PATH) -> dict | None:
+    """Lazy-load the pickled classifier produced by analysis/v2_backtest.py.
+    Returns None if the file is missing — the bot stays usable without it."""
+    global _ML_BUNDLE_CACHE
+    if _ML_BUNDLE_CACHE is not None:
+        return _ML_BUNDLE_CACHE
+    if not os.path.exists(path):
+        return None
+    try:
+        with open(path, "rb") as f:
+            _ML_BUNDLE_CACHE = pickle.load(f)
+    except Exception as e:
+        print(f"[ml] WARN: failed to load model: {type(e).__name__}: {e}",
+              file=sys.stderr)
+        return None
+    return _ML_BUNDLE_CACHE
+
+
+def ml_gate_latest(df: pd.DataFrame, z: pd.Series, regime: pd.Series | None,
+                   threshold: float = ML_THRESHOLD) -> tuple[bool, float | None]:
+    """Score the latest bar with the saved classifier and decide whether a
+    fresh entry should be taken. Returns (allow, proba). If the model isn't
+    available we return (True, None) so the bot proceeds unchanged."""
+    bundle = _load_ml_bundle()
+    if bundle is None or not _V2_AVAILABLE:
+        return True, None
+    model    = bundle["model"]
+    feat_cols = bundle["feature_cols"]
+    try:
+        feats = build_features(df, z=z, regime=regime,
+                               hurst=df.get("hurst"),
+                               adf_p=df.get("adf_p"))
+    except Exception as e:
+        print(f"[ml] WARN: feature build failed: {type(e).__name__}: {e}",
+              file=sys.stderr)
+        return True, None
+    if not feats.empty:
+        last = feats.iloc[[-1]].reindex(columns=feat_cols)
+        # HistGradientBoosting handles NaN natively, so we don't refuse to
+        # score on missing features. We *do* require the most-load-bearing
+        # column ('z') to be finite, since a NaN z means the rolling window
+        # hasn't filled yet.
+        if "z" in last.columns and not np.isfinite(last["z"].iloc[0]):
+            return True, None
+        try:
+            proba = float(model.predict_proba(last.values)[:, 1][0])
+        except Exception as e:
+            print(f"[ml] WARN: predict failed: {type(e).__name__}: {e}",
+                  file=sys.stderr)
+            return True, None
+        return (proba >= threshold), proba
+    return True, None
 
 
 def backtest(eth: pd.Series, btc: pd.Series, pos: pd.Series,
@@ -590,7 +698,9 @@ def _format_alert(snap: dict, prev_pos: int) -> tuple[str, str]:
     lines.append(f"Time:        {snap['asof']}")
     lines.append("")
 
-    mode = snap.get("mode", MODE)
+    # `effective_mode` is the actual direction the bot took at this bar
+    # (auto-mode resolves to momentum or mean-revert via the regime detector).
+    mode = snap.get("effective_mode") or snap.get("mode", MODE)
     if pos == +1:
         if mode == "momentum":
             lines.append("WHY:   ETH/BTC ratio is breaking up; betting on continuation.")
@@ -648,7 +758,8 @@ def _format_alert(snap: dict, prev_pos: int) -> tuple[str, str]:
 def run_once(kline: str = INTERVAL, source: str = "binance",
              cmc_api_key: str | None = None,
              verbose: bool = True, write_artifacts: bool = True,
-             mode: str = MODE) -> dict:
+             mode: str = MODE,
+             use_ml: bool = False) -> dict:
     """Fetch latest data, compute signal, optionally write CSV/PNG/JSON.
 
     source = "binance": full historical klines (instant backtest).
@@ -674,8 +785,11 @@ def run_once(kline: str = INTERVAL, source: str = "binance",
             print(f"[{now_str}] Fetching BTCUSDT + ETHUSDT from Binance ({kline})...")
         btc = fetch_klines("BTCUSDT", kline, LOOKBACK_LIMIT)
         eth = fetch_klines("ETHUSDT", kline, LOOKBACK_LIMIT)
-        df = pd.concat([btc, eth], axis=1).dropna()
-        df.columns = ["btc", "eth"]
+        df = pd.concat([btc, eth], axis=1).dropna(subset=["BTCUSDT", "ETHUSDT"])
+        df = df.rename(columns={
+            "BTCUSDT":     "btc", "BTCUSDT_vol": "btc_vol",
+            "ETHUSDT":     "eth", "ETHUSDT_vol": "eth_vol",
+        })
 
     df["ratio"]   = df["eth"] / df["btc"]
     log_r         = np.log(df["ratio"])
@@ -683,7 +797,70 @@ def run_once(kline: str = INTERVAL, source: str = "binance",
     df["log_sd"]  = log_r.rolling(ROLLING_WINDOW).std().where(
         log_r.rolling(ROLLING_WINDOW).std() > 0)
     df["z"]       = (log_r - df["log_mu"]) / df["log_sd"]
-    df["pos"]     = generate_positions(df["z"], mode=mode)
+
+    # --- v2 regime detection (only if auto-regime is requested) ---
+    regime_series = None
+    effective_mode = mode
+    if mode == "auto":
+        if not _V2_AVAILABLE:
+            if verbose:
+                print(f"[regime] WARN: v2 modules not available "
+                      f"({_V2_IMPORT_ERR!r}); falling back to MODE='momentum'.")
+            effective_mode = "momentum"
+        else:
+            try:
+                # The live bot keeps `ratio` rather than `log_r`; the regime
+                # detector wants the log spread.
+                log_r_for_regime = np.log(df["ratio"])
+                rg = detect_regime(log_r_for_regime, hurst_window=240,
+                                   adf_window=240, adf_step=4,
+                                   bands=RegimeBands(
+                                       h_trend=0.53, h_meanrev=0.47,
+                                       adf_trend=0.15, adf_meanrev=0.08,
+                                       hysteresis_bars=4,
+                                       initial_regime="momentum"))
+                df["hurst"]  = rg["hurst"]
+                df["adf_p"]  = rg["adf_p"]
+                df["regime"] = rg["regime"]
+                regime_series = rg["regime"]
+            except Exception as e:
+                if verbose:
+                    print(f"[regime] WARN: detection failed "
+                          f"({type(e).__name__}: {e}); falling back to "
+                          f"MODE='momentum'.")
+                effective_mode = "momentum"
+
+    df["pos"]     = generate_positions(df["z"], mode=effective_mode,
+                                       regime=regime_series)
+
+    # If we ran in auto-mode, surface the direction the regime detector picked
+    # at the latest bar so downstream output (and `effective_mode` in the snap)
+    # is always a concrete momentum/mean-revert label rather than "auto".
+    if mode == "auto" and regime_series is not None and len(regime_series):
+        latest_regime = str(regime_series.iloc[-1])
+        if latest_regime in ("momentum", "mean-revert"):
+            effective_mode = latest_regime
+        elif latest_regime == "indeterminate":
+            effective_mode = "indeterminate"
+
+    # --- v2 ML gate (opt-in; vetoes the most recent fresh entry only) ---
+    ml_proba = None
+    ml_vetoed = False
+    if use_ml:
+        last_idx = df.index[-1] if len(df) else None
+        if last_idx is not None and len(df) >= 2:
+            prev_pos = float(df["pos"].iloc[-2]) if len(df) >= 2 else 0.0
+            cur_pos  = float(df["pos"].iloc[-1])
+            if cur_pos != 0 and prev_pos == 0:    # fresh entry on this bar
+                allow, ml_proba = ml_gate_latest(df, df["z"], regime_series)
+                if not allow:
+                    ml_vetoed = True
+                    df.loc[last_idx, "pos"] = 0.0   # veto
+                    if verbose:
+                        print(f"[ml] entry VETOED (proba={ml_proba:.3f} "
+                              f"< {ML_THRESHOLD})")
+                elif verbose and ml_proba is not None:
+                    print(f"[ml] entry allowed (proba={ml_proba:.3f})")
 
     # Backtest only makes sense when we have enough history and a clear bar cadence.
     if source == "cmc" and len(df) < ROLLING_WINDOW + 2:
@@ -735,11 +912,21 @@ def run_once(kline: str = INTERVAL, source: str = "binance",
         "stop_up_ratio": stop_up,
         "stop_dn_ratio": stop_dn,
         "pct_to_mean":   pct_to_mean,
-        "signal":        describe_signal(latest["z"], latest["pos"], mode=mode),
+        "signal":        describe_signal(latest["z"], latest["pos"],
+                                          mode=effective_mode),
         "stats":         stats,
         "kline":         kline,
         "source":        source,
         "mode":          mode,
+        "effective_mode": effective_mode if mode == "auto" else mode,
+        "regime":        (str(regime_series.iloc[-1])
+                          if regime_series is not None else None),
+        "hurst":         (float(df["hurst"].iloc[-1])
+                          if "hurst" in df else None),
+        "adf_p":         (float(df["adf_p"].iloc[-1])
+                          if "adf_p" in df else None),
+        "ml_proba":      ml_proba,
+        "ml_vetoed":     ml_vetoed,
     }
 
     if verbose:
@@ -754,8 +941,26 @@ def run_once(kline: str = INTERVAL, source: str = "binance",
         print("    Mean-reversion variants all negative (Sharpe -0.22 to -3.85).")
         print("    See analysis/research_report.md for the full sweep.")
         print("-" * 64)
-        print(f"Mode:           {mode.upper():>13s}   "
-              f"(walk-forward winner; see analysis/research_report.md)")
+        if mode == "auto":
+            r = snap.get("regime") or "n/a"
+            h = snap.get("hurst")
+            ap = snap.get("adf_p")
+            h_s = f"{h:+.3f}" if h is not None else "n/a"
+            ap_s = f"{ap:.3f}" if ap is not None else "n/a"
+            print(f"Mode:           {mode.upper():>13s}   "
+                  f"(regime: {r}, Hurst {h_s}, ADF p {ap_s})")
+            print(f"Effective:      {effective_mode.upper():>13s}")
+        else:
+            print(f"Mode:           {mode.upper():>13s}   "
+                  f"(walk-forward winner; see analysis/research_report.md)")
+        if use_ml:
+            if ml_proba is None:
+                print("ML gate:        not active this bar (no entry to score)")
+            elif ml_vetoed:
+                print(f"ML gate:        VETOED entry (proba {ml_proba:.3f} "
+                      f"< {ML_THRESHOLD})")
+            else:
+                print(f"ML gate:        ALLOWED entry (proba {ml_proba:.3f})")
         print(f"As of:          {latest.name}")
         print(f"BTC close:      ${latest['btc']:>12,.2f}")
         print(f"ETH close:      ${latest['eth']:>12,.2f}")
@@ -880,7 +1085,8 @@ def run_once_with_alerts(kline: str, source: str = "binance",
                          cmc_api_key: str | None = None,
                          alert_email: bool = False,
                          alert_telegram: bool = False,
-                         mode: str = MODE) -> int:
+                         mode: str = MODE,
+                         use_ml: bool = False) -> int:
     """One-shot run for CI / cron: fetch, compute, save state, alert on flip,
     exit. Returns 0 on success, non-zero on misconfiguration. Always tries to
     succeed if data fetch fails (logs and exits 0) so the cron schedule
@@ -903,7 +1109,8 @@ def run_once_with_alerts(kline: str, source: str = "binance",
 
     try:
         snap = run_once(kline=kline, source=source, cmc_api_key=cmc_api_key,
-                        verbose=True, write_artifacts=True, mode=mode)
+                        verbose=True, write_artifacts=True, mode=mode,
+                        use_ml=use_ml)
     except Exception as e:
         print(f"[WARN] fetch failed: {type(e).__name__}: {e}. Skipping.")
         return 0  # transient failure -> still exit cleanly so cron stays green
@@ -917,7 +1124,8 @@ def run_loop(interval_minutes: int, kline: str,
              cmc_api_key: str | None = None,
              alert_email: bool = False,
              alert_telegram: bool = False,
-             mode: str = MODE) -> int:
+             mode: str = MODE,
+             use_ml: bool = False) -> int:
     """Poll every N minutes. Prints heartbeat; shouts when position flips."""
     stop = {"flag": False}
     def _handler(signum, frame):
@@ -959,7 +1167,7 @@ def run_loop(interval_minutes: int, kline: str,
             snap = run_once(kline=kline, source=source,
                             cmc_api_key=cmc_api_key,
                             verbose=True, write_artifacts=True,
-                            mode=mode)
+                            mode=mode, use_ml=use_ml)
         except Exception as e:
             print(f"[WARN] fetch failed: {type(e).__name__}: {e}. "
                   f"Will retry in {interval_minutes} min.")
@@ -986,11 +1194,23 @@ def main(argv: list[str] | None = None) -> int:
                    help="polling interval in minutes (default 15). Ignored without --loop.")
     p.add_argument("--kline", default=INTERVAL,
                    help=f"Binance kline interval: 1d/4h/1h/15m/5m (default {INTERVAL})")
-    p.add_argument("--mode", choices=["momentum", "mean-revert"], default=MODE,
-                   help=f"signal direction. Default '{MODE}' is the walk-forward "
-                        f"winner across 102 (timeframe x window x entry_z x "
-                        f"direction) combinations on 14 months of data; see "
-                        f"analysis/research_report.md.")
+    p.add_argument("--mode", choices=["auto", "momentum", "mean-revert"],
+                   default=MODE,
+                   help=f"signal direction. 'auto' (default) uses the v2 "
+                        f"regime detector (Hurst + rolling ADF) to pick "
+                        f"momentum or mean-revert per entry. 'momentum' / "
+                        f"'mean-revert' override. The walk-forward audit on "
+                        f"32 months of 4h data shows 100%% momentum-regime "
+                        f"so 'auto' currently behaves as 'momentum'; the "
+                        f"detector is shipped for future regime changes.")
+    p.add_argument("--use-ml", action="store_true",
+                   help="OPT-IN: gate fresh entries with the trained "
+                        "HistGradientBoosting classifier saved at "
+                        "analysis/model.pkl. Walk-forward AUC on the audited "
+                        "sample is 0.57-0.60; not enough to dominate the bare "
+                        "momentum signal in our backtests, so it is OFF by "
+                        "default. Useful as a 'second opinion' veto if you "
+                        "want fewer / higher-conviction trades.")
     p.add_argument("--source", choices=["binance", "cmc"], default="binance",
                    help="data source: Binance historical klines (default) or "
                         "CoinMarketCap latest quotes accumulating locally")
@@ -1093,18 +1313,18 @@ def main(argv: list[str] | None = None) -> int:
         return run_once_with_alerts(
             args.kline, source=args.source, cmc_api_key=args.cmc_key,
             alert_email=args.alert_email, alert_telegram=args.alert_telegram,
-            mode=args.mode)
+            mode=args.mode, use_ml=args.use_ml)
 
     if args.loop:
         return run_loop(args.interval_minutes, args.kline,
                         source=args.source, cmc_api_key=args.cmc_key,
                         alert_email=args.alert_email,
                         alert_telegram=args.alert_telegram,
-                        mode=args.mode)
+                        mode=args.mode, use_ml=args.use_ml)
     run_once(kline=args.kline, source=args.source,
              cmc_api_key=args.cmc_key,
              verbose=True, write_artifacts=True,
-             mode=args.mode)
+             mode=args.mode, use_ml=args.use_ml)
     print(f"\nWrote: eth_btc_pairs.csv, eth_btc_pairs.png, "
           f"eth_btc_trades.csv, eth_btc_latest_signal.json")
     return 0

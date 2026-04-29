@@ -19,6 +19,12 @@ analysis/_cache_*.csv
 analysis/research_curves.png
 analysis/research_metrics.json
 analysis/sweep_results.json
+analysis/v2_curves.png
+analysis/v2_metrics.json
+analysis/v2_report.txt
+# NOTE: analysis/model.pkl and analysis/model_meta.json ARE committed so the
+# live bot (and GitHub Actions) can load them. Re-train with
+# `python analysis/v2_backtest.py` to refresh.
 
 # --- Python ---
 __pycache__/
