@@ -1093,14 +1093,21 @@ def run_once_with_alerts(kline: str, source: str = "binance",
     doesn't go red on a transient outage."""
     email_cfg = _load_alert_config()    if alert_email    else None
     tg_cfg    = _load_telegram_config() if alert_telegram else None
+    # Missing secrets used to be a hard exit-2 — that turns the GitHub Action
+    # red on every run if the user forgot to add the repo secrets. Soften it
+    # to a warning + run-without-alerts: the bot still computes the signal,
+    # writes outputs, and saves state. The worst case is "no alert went out
+    # this poll" rather than "the workflow is broken".
     if alert_email and not email_cfg:
-        print("ERROR: --alert-email set but SMTP_* / ALERT_TO env vars are "
-              "not all set.", file=sys.stderr)
-        return 2
+        print("[alert] WARN: --alert-email set but SMTP_* / ALERT_TO env vars "
+              "are not all set; continuing without email alerts.",
+              file=sys.stderr)
+        email_cfg = None
     if alert_telegram and (not tg_cfg or not tg_cfg.get("chat_id")):
-        print("ERROR: --alert-telegram needs both TELEGRAM_BOT_TOKEN and "
-              "TELEGRAM_CHAT_ID env vars.", file=sys.stderr)
-        return 2
+        print("[alert] WARN: --alert-telegram set but TELEGRAM_BOT_TOKEN / "
+              "TELEGRAM_CHAT_ID env vars are not all set; continuing without "
+              "Telegram alerts.", file=sys.stderr)
+        tg_cfg = None
 
     state = _load_state()
     last_pos = state.get("position")
@@ -1137,19 +1144,15 @@ def run_loop(interval_minutes: int, kline: str,
     email_cfg = _load_alert_config()    if alert_email    else None
     tg_cfg    = _load_telegram_config() if alert_telegram else None
     if alert_email and not email_cfg:
-        print("ERROR: --alert-email set but SMTP_HOST/SMTP_USER/SMTP_PASS/"
-              "ALERT_TO env vars are not all set. See --help for details.",
+        print("[alert] WARN: --alert-email set but SMTP_* / ALERT_TO env vars "
+              "are not all set; continuing without email alerts.",
               file=sys.stderr)
-        return 2
-    if alert_telegram and not tg_cfg:
-        print("ERROR: --alert-telegram set but TELEGRAM_BOT_TOKEN env var "
-              "is not set.", file=sys.stderr)
-        return 2
-    if alert_telegram and tg_cfg and not tg_cfg.get("chat_id"):
-        print("ERROR: TELEGRAM_CHAT_ID not set. After messaging your bot, "
-              "run: python eth_btc_pairs.py --telegram-find-chat-id",
-              file=sys.stderr)
-        return 2
+        email_cfg = None
+    if alert_telegram and (not tg_cfg or not tg_cfg.get("chat_id")):
+        print("[alert] WARN: --alert-telegram set but TELEGRAM_BOT_TOKEN / "
+              "TELEGRAM_CHAT_ID env vars are not all set; continuing without "
+              "Telegram alerts.", file=sys.stderr)
+        tg_cfg = None
 
     state = _load_state()
     last_pos = state.get("position")
